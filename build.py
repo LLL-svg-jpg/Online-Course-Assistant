@@ -203,7 +203,8 @@ def build(
             for path in missing_assets:
                 print(f"  · {path}")
             return 1
-    for name in ("config.example.toml", "README.md", "requirements.txt", "安装依赖.bat"):
+    for name in ("config.example.toml", "README.md", "requirements.txt", "安装依赖.bat",
+                 "THIRD_PARTY_NOTICES.txt"):
         src = ROOT / name
         if src.exists():
             shutil.copy2(src, target / name)

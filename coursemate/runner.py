@@ -33,7 +33,7 @@ from .workers import (
     task_monitor,
     tuning_worker,
 )
-from .zhihuishu_work import is_work_url, study_work
+from .zhihuishu_work import is_homework_url, is_work_list_url, is_work_url, study_tests, study_work
 from .verification import has_verification, wait_verification
 
 logger = Logger()
@@ -332,17 +332,19 @@ async def study_course(
     return True
 
 
-async def watch_address(awaitable, verification_task: asyncio.Task, should_stop) -> bool:
+async def watch_address(awaitable, verification_task: asyncio.Task | None, should_stop) -> bool:
     task = asyncio.create_task(awaitable)
     try:
         while True:
             if should_stop():
                 raise StopRequested
-            if verification_task.done() and not verification_task.cancelled():
+            if verification_task is not None and verification_task.done() and not verification_task.cancelled():
                 exc = verification_task.exception()
                 if isinstance(exc, VerificationTimeout):
                     raise exc
-            waiting = {task} if verification_task.done() else {task, verification_task}
+            waiting = {task}
+            if verification_task is not None and not verification_task.done():
+                waiting.add(verification_task)
             done, _ = await asyncio.wait(waiting, timeout=0.25,
                                          return_when=asyncio.FIRST_COMPLETED)
             if should_stop():
@@ -394,6 +396,7 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
     page = context = browser = None
     active_account = None
     login_ready = False
+    retained_contexts: set[BrowserContext] = set()
 
     async with async_playwright() as p:
         try:
@@ -411,11 +414,12 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
                     completed = False
                     continue
                 account = dict(account, platform=adapter.name)
-                if account != active_account or context is None:
+                if account != active_account or context is None or context in retained_contexts:
                     if context is not None:
                         if login_ready:
                             await persist_login(context, active_account)
-                        await context.close()
+                        if context not in retained_contexts:
+                            await context.close()
                     if browser is None:
                         page, context = await launch(p, config, account)
                         browser = context.browser
@@ -423,6 +427,8 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
                         page, context = await open_context(browser, config, account)
                     active_account = account
                     login_ready = False
+                if page is None or page.is_closed():
+                    page = await context.new_page()
                 logger.info("=" * 46, shift=True)
                 try:
                     await ensure_login(page, context, adapter, config, should_stop, account)
@@ -439,12 +445,28 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
                     continue
                 # 账号填充、协议勾选及可能出现的人工安全验证完成后再开始计时。
                 clock.reset()
-                if is_work_url(url):
+                if is_work_url(url) or is_work_list_url(url):
                     if not config.answer_enabled:
                         logger.warn("AI 答题未启用，智慧树测试/考试不自动处理。")
                         completed = False
                         continue
                     await page.goto(url, wait_until="domcontentloaded")
+                    if is_homework_url(url) or is_work_list_url(url):
+                        processed = await watch_address(study_tests(
+                            page, provider, cache, config.answer_cache, should_stop,
+                        ), None, should_stop)
+                        if processed:
+                            if not page.is_closed():
+                                await page.close()
+                            page = None
+                            studied_any = True
+                        else:
+                            logger.warn("平时测试未确认全部提交，页面保留供人工检查。")
+                            completed = False
+                            retain_failure_page = True
+                            retained_contexts.add(context)
+                            page = None
+                        continue
                     processed = await study_work(
                         page, provider, cache, config.answer_cache,
                         config.exam_auto_submit if "doexamination" in url.lower()
@@ -518,6 +540,11 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
                     else:
                         completed = False
                         retain_failure_page = retain_failure_page or not verification_skipped
+                        if not verification_skipped and any(
+                            tab is not page and (is_homework_url(tab.url) or is_work_list_url(tab.url))
+                            for tab in context.pages
+                        ):
+                            retained_contexts.add(context)
                 finally:
                     for task in tasks:
                         task.cancel()
@@ -543,7 +570,7 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
 
             # 一节都没学成就直接关浏览器，用户只会看到"窗口一闪就没了"，
             # 既看不到出错页面也没法手动接管。留着窗口，由用户点停止再关。
-            if retain_failure_page and config.keep_browser_open and not config.headless:
+            if retain_failure_page and (config.keep_browser_open or retained_contexts) and not config.headless:
                 logger.warn("有任务未能完成，浏览器先不关闭。", shift=True)
                 logger.warn("你可以在浏览器里手动看看是哪一步不对；"
                             "看完点界面上的「停止」按钮即可关闭。")

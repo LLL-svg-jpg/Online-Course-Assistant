@@ -489,6 +489,8 @@ async def question_worker(
                 finally:
                     await hold_playback_for_manual_check(page, adapter, False, "question")
                     clock.add_paused(time.time() - paused_at)
+                if getattr(adapter, "ui_playback", False):
+                    await adapter.ensure_playing(page)
                 continue
             try:
                 await asyncio.wait_for(
@@ -509,7 +511,11 @@ async def question_worker(
 
             elapsed = time.time() - paused_at
             clock.add_paused(elapsed)
-            logger.info(f"答题结束，耗时 {elapsed:.0f} 秒不计入学习时长，继续播放。", shift=True)
+            playback = "继续播放。"
+            if getattr(adapter, "ui_playback", False):
+                resumed = await adapter.ensure_playing(page)
+                playback = "继续播放。" if resumed else "续播任务将继续检查播放状态。"
+            logger.info(f"答题结束，耗时 {elapsed:.0f} 秒不计入学习时长，{playback}", shift=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

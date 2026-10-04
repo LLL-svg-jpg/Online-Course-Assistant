@@ -28,7 +28,7 @@ from .config import SPEED_MAX, SPEED_MAX_UNLOCKED, SPEED_MIN, Config, ConfigErro
 from .config_writer import save_config
 from .logger import Logger
 from .paths import app_dir, is_frozen, resource
-from . import providers
+from . import providers, updates
 
 APP_NAME = "Online Course Assistant"
 PROJECT_URL = "https://github.com/LLL-svg-jpg/Online-Course-Assistant"
@@ -542,6 +542,8 @@ class CourseMateGUI:
         self.root = root
         self.logger = Logger()
         self.log_queue: queue.Queue = queue.Queue()
+        self._update_events: queue.Queue = queue.Queue()
+        self._installing_update = False
         self.worker: threading.Thread | None = None
         self.stop_event = threading.Event()
         self._log_lines = 0
@@ -1176,13 +1178,89 @@ class CourseMateGUI:
         self.deps_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Button(box, text="检查运行依赖", command=self._show_deps).grid(
             row=4, column=0, sticky="w", pady=(8, 0))
+        self.check_update_button = ttk.Button(box, text="检查更新", command=self._check_updates)
+        self.check_update_button.grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        self.update_status_var = tk.StringVar(value="点击检查已发布的最新版本")
+        ttk.Label(box, textvariable=self.update_status_var, style="Hint.TLabel").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(box, text="仅供学习研究。是否符合所在平台条款与学校规范，请自行判断",
-                  style="Warn.TLabel").grid(row=5, column=0, columnspan=3,
+                  style="Warn.TLabel").grid(row=6, column=0, columnspan=3,
                                             sticky="w", pady=(8, 0))
 
         self._refresh_settings_info()
         self._show_section("界面")
         return tab
+
+    def _run_update_job(self, event: str, job) -> None:
+        self.check_update_button.configure(state="disabled")
+
+        def work():
+            try:
+                self._update_events.put((event, job()))
+            except Exception as exc:
+                self._update_events.put(("error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _check_updates(self) -> None:
+        self.update_status_var.set("正在检查更新…")
+        self._run_update_job("checked", updates.check_latest)
+
+    def _updates_checked(self, release: updates.Release) -> None:
+        from . import __version__
+
+        if not release.newer_than(__version__):
+            text = (f"当前 v{__version__} 已是最新版本。" if release.version == __version__ else
+                    f"当前 v{__version__} 高于已发布的 v{release.version}，暂无更新。")
+            self.update_status_var.set(text)
+            messagebox.showinfo("检查更新", text, parent=self.root)
+            return
+        self.update_status_var.set(f"发现新版 v{release.version}")
+        if not is_frozen():
+            messagebox.showinfo("发现新版", f"发现 v{release.version}。\n源码运行请从项目 Releases 下载新版，"
+                                "不能用 EXE 更新包覆盖源码目录。", parent=self.root)
+            return
+        if not release.installable:
+            messagebox.showinfo("发现新版", f"发现 v{release.version}，但尚无带 SHA-256 的 Windows x64 更新包。"
+                                "\n请稍后再检查。", parent=self.root)
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("发现新版", "请先停止当前任务，再检查并安装更新。", parent=self.root)
+            return
+        if not messagebox.askyesno(
+            "是否更新", f"当前 v{__version__}，新版 v{release.version}。\n"
+            f"更新包约 {release.size / 1024 ** 2:.1f} MB。\n\n"
+            "下载校验后将退出软件，在原目录更新并重新打开。\n"
+            "保留账号、配置、登录状态和题库；旧程序另存备份。\n\n是否更新？", parent=self.root,
+        ):
+            return
+        self._installing_update = True
+        self.update_status_var.set("正在准备更新…")
+        directory = app_dir()
+        self._run_update_job("prepared", lambda: updates.prepare_update(
+            release, directory, lambda text: self._update_events.put(("progress", text))))
+
+    def _drain_update_events(self) -> None:
+        while True:
+            try:
+                event, value = self._update_events.get_nowait()
+            except queue.Empty:
+                break
+            if event == "progress":
+                self.update_status_var.set(value)
+                continue
+            self.check_update_button.configure(state="normal")
+            self._installing_update = False
+            if event == "checked":
+                self._updates_checked(value)
+            elif event == "prepared":
+                self.update_status_var.set("校验通过，正在退出并更新…")
+                self.quit_app(prepared_update=value)
+                if getattr(self, "_closing", False):
+                    return
+            else:
+                self.update_status_var.set("检查或准备更新失败；旧程序未改动")
+                messagebox.showerror("更新失败", str(value), parent=self.root)
 
     def _open_project(self, _event=None) -> None:
         from .config import detect_browser
@@ -2486,6 +2564,9 @@ class CourseMateGUI:
         self.start()
 
     def start(self) -> None:
+        if self._installing_update:
+            messagebox.showinfo("正在准备更新", "请等待更新完成后再开始任务。", parent=self.root)
+            return
         if self.worker and self.worker.is_alive():
             return
         if not self.url_list.get_urls():
@@ -2617,6 +2698,9 @@ class CourseMateGUI:
         self.log_queue.put((level, message, ts))
 
     def _drain_log_queue(self) -> None:
+        self._drain_update_events()
+        if getattr(self, "_closing", False):
+            return
         drained = 0
         # 每轮最多取 200 条，避免刷屏时界面卡死
         while drained < 200:
@@ -2808,10 +2892,13 @@ class CourseMateGUI:
         self._append_log("ERROR", "配置未保存，已取消退出或收进托盘。")
         return False
 
-    def quit_app(self) -> None:
+    def quit_app(self, prepared_update: Path | None = None) -> None:
         """真正退出。托盘菜单的「退出」走这条。"""
         if getattr(self, "_closing", False):
             return              # 托盘和窗口可能同时触发，别走两遍
+        if prepared_update is not None and self.worker and self.worker.is_alive():
+            messagebox.showinfo("更新已准备", "请先停止当前任务，再安装更新。", parent=self.root)
+            return
         if self.worker and self.worker.is_alive():
             if not messagebox.askokcancel(
                 "确认退出", "刷课正在进行中，确定要退出吗？\n\n"
@@ -2821,6 +2908,13 @@ class CourseMateGUI:
                 return
         if not self._save_before_leaving():
             return
+        if prepared_update is not None:
+            try:
+                updates.launch_update(prepared_update)
+            except Exception as exc:
+                self.update_status_var.set("更新未启动，软件继续运行")
+                messagebox.showerror("更新未启动", str(exc), parent=self.root)
+                return
         self._closing = True
         self._save_geometry()
         self._stop_tray()

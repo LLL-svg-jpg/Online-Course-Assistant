@@ -239,7 +239,8 @@ def build_provider(config) -> AnswerProvider | None:
     if not config.answer_enabled:
         return None
     if not config.api_key:
-        logger.warn("未配置 AI API Key，将直接按选项顺序逐个尝试作答。")
+        logger.warn("未配置 AI API Key，无法调用 AI。独立测试只使用题库参考或保留已有答案；"
+                    "视频弹题是否试错由答错重试设置控制。")
         return None
 
     # anthropic 之外的服务商（DeepSeek / 通义 / 智谱 / Kimi 等）都是 OpenAI 兼容协议

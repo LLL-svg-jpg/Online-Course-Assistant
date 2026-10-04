@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from urllib.parse import urlparse
 
 from playwright.async_api import BrowserContext, Page
@@ -100,6 +101,10 @@ class ZhihuishuAdapter(PlatformAdapter):
         self._unsupported_speed: float | None = None
         self._popup_question_count = 0
         self._current_question_index = 0
+        self._playback_lock = asyncio.Lock()
+        self._chapter_test_rank: int | None = None
+        self._chapter_test_key = ""
+        self._confirmed_tests: set[str] = set()
         self.work_page: Page | None = None
         self.course_page_lost = False
         self.course_url = ""
@@ -182,6 +187,7 @@ class ZhihuishuAdapter(PlatformAdapter):
     ERROR_HINTS = ("404", "页面不存在", "找不到", "无权限", "not found", "出错了")
 
     async def open_course(self, page: Page, url: str) -> str:
+        self._confirmed_tests.clear()
         self.is_hike = "hike.zhihuishu.com" in url
         parsed = urlparse(url)
         self.is_shared = (parsed.hostname or "").lower() == "studyvideoh5.zhihuishu.com" \
@@ -298,6 +304,8 @@ class ZhihuishuAdapter(PlatformAdapter):
                 progress = await handle.query_selector(".progress-num")
                 if progress and (await progress.text_content() or "").strip() == "100%":
                     finished = True
+            if kind == "chapter" and str(index) in self._confirmed_tests:
+                finished = True
             lessons.append(Lesson(title=title or "未命名小节", handle=handle,
                                   finished=finished, key=str(index), kind=kind))
         return lessons
@@ -320,24 +328,48 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     async def ensure_playing(self, page: Page) -> bool:
         """仅通过播放器可见控件续播，不注入 play/pause 守卫。"""
-        if self.work_page is not None and self.work_page is not page:
+        async with self._playback_lock:
+            if self.work_page is not None and self.work_page is not page:
+                return False
+            if await self.detect_question(page) or await self.detect_captcha(page):
+                return False
+            active_key = await self.active_lesson_key(page)
+            if not active_key:
+                return False
+            lessons = await self.list_lessons(page)
+            if not any(item.key == active_key and item.kind == "video"
+                       and not item.finished for item in lessons):
+                return False
+            video = page.locator("video").first
+            if not await video.count() or not await video.evaluate(
+                "v => v.paused && !v.ended && !v.__coursemateManualHold"
+            ):
+                return False
+            player = page.locator("#vjs_container").first
+            await (player if await player.count() else video).hover(timeout=2000)
+            for selector in ("#playButton .bigPlayButton, .bigPlayButton.pointer",
+                             "#playButton", ".vjs-big-play-button", ".vjs-play-control"):
+                button = page.locator(selector).first
+                if not await button.count() or not await button.is_visible():
+                    continue
+                if await self.active_lesson_key(page) != active_key or not await video.evaluate(
+                    "v => v.paused && !v.ended && !v.__coursemateManualHold"
+                ):
+                    return False
+                handle = await video.element_handle()
+                before = await video.evaluate("v => v.currentTime")
+                await button.click(timeout=2000)
+                try:
+                    await page.wait_for_function(
+                        "([v, before]) => v.isConnected && !v.paused && !v.ended "
+                        "&& v.currentTime > before + 0.05",
+                        arg=[handle, before], timeout=2000,
+                    )
+                    return await self.active_lesson_key(page) == active_key
+                except Exception:
+                    if not await video.evaluate("v => v.paused"):
+                        return False
             return False
-        if await self.detect_question(page) or await self.detect_captcha(page):
-            return False
-        active_key = await self.active_lesson_key(page)
-        if not active_key:
-            return False
-        lessons = await self.list_lessons(page)
-        if any(item.key == active_key and item.finished for item in lessons):
-            return False
-        video = page.locator("video").first
-        if not await video.count() or not await video.evaluate("v => v.paused && !v.ended"):
-            return False
-        button = page.locator("#playButton .bigPlayButton, .bigPlayButton.pointer").first
-        if not await button.count() or not await button.is_visible():
-            return False
-        await button.click(timeout=3000)
-        return True
 
     async def tune_playback(self, page: Page, speed: float, mute: bool) -> None:
         """智慧树仅使用页面提供的倍速档；静音由浏览器启动参数处理。"""
@@ -398,6 +430,26 @@ class ZhihuishuAdapter(PlatformAdapter):
     async def enter_lesson(self, page: Page, lesson: Lesson) -> bool:
         await self.prepare_page(page)
         if lesson.kind == "chapter":
+            self._chapter_test_key = lesson.key
+            self._chapter_test_rank = None
+            label = await lesson.handle.evaluate("""el =>
+                el.closest('ul.list')?.querySelector('.chapter .catalogue_title3 b')?.textContent.trim() || ''
+            """)
+            if label == "绪章":
+                self._chapter_test_rank = 0
+            else:
+                match = re.fullmatch(r"第([\d一二三四五六七八九十]+)章", label)
+                if match:
+                    number = match.group(1)
+                    digits = "零一二三四五六七八九"
+                    if number.isdecimal():
+                        self._chapter_test_rank = int(number)
+                    elif "十" in number:
+                        tens, units = number.split("十", 1)
+                        self._chapter_test_rank = (digits.index(tens) if tens else 1) * 10 \
+                            + (digits.index(units) if units else 0)
+                    else:
+                        self._chapter_test_rank = digits.index(number)
             before = set(page.context.pages)
             await lesson.handle.click(timeout=10000)
             await page.wait_for_timeout(1200)
@@ -438,15 +490,19 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     async def process_chapter_test(self, page: Page, provider, cache, use_cache: bool,
                                    auto_submit: bool, should_stop) -> bool:
-        from ..zhihuishu_work import is_work_url, study_work
+        from ..zhihuishu_work import is_work_list_url, study_tests
 
         work_page = self.work_page or page
         try:
-            if not is_work_url(work_page.url):
-                logger.warn("平时测试未进入可识别的智慧树作答页，本项跳过并继续课程。")
+            if is_work_list_url(work_page.url) and self._chapter_test_rank is None:
+                logger.warn("未识别课程目录的章号，未选择其他章的平时测试。")
                 return False
-            processed = await study_work(work_page, provider, cache, use_cache,
-                                         auto_submit, should_stop)
+            processed = await study_tests(work_page, provider, cache, use_cache, should_stop,
+                                          target_rank=self._chapter_test_rank)
+            if processed:
+                self._confirmed_tests.add(self._chapter_test_key)
+                if work_page is not page and not work_page.is_closed():
+                    await work_page.close()
             return processed
         finally:
             self.work_page = None
