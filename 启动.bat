@@ -5,6 +5,10 @@ title Online Course Assistant
 
 rem 优先用打包好的 exe。用 pythonw 跑 .pyw 也能用，但那样任务管理器里
 rem 显示的是 Python 和 Python 的图标，看不出是哪个软件。
+if exist "dist\OnlineCourseAssistant-v1.0.3-windows-x64\OnlineCourseAssistant\OnlineCourseAssistant.exe" (
+    start "" "dist\OnlineCourseAssistant-v1.0.3-windows-x64\OnlineCourseAssistant\OnlineCourseAssistant.exe"
+    exit /b 0
+)
 if exist "dist\OnlineCourseAssistant-v1.0.2-windows-x64\OnlineCourseAssistant\OnlineCourseAssistant.exe" (
     start "" "dist\OnlineCourseAssistant-v1.0.2-windows-x64\OnlineCourseAssistant\OnlineCourseAssistant.exe"
     exit /b 0

@@ -596,6 +596,29 @@ class CourseMateGUI:
             selectbackground=[("readonly focus", "#ffffff"), ("readonly", "#ffffff")],
             fieldbackground=[("readonly focus", "#ffffff"), ("readonly", "#ffffff")],
         )
+        if style.theme_use() == "vista":
+            # 原生边框和箭头的焦点、悬停、按下状态会变蓝；保持普通灰色绘制。
+            for element, part, options in (
+                ("border", 4, {}),
+                ("rightdownarrow", 6, {"syssize": ("SM_CXVSCROLL", "SM_CYVSCROLL")}),
+            ):
+                style.element_create(f"CourseMate.Combobox.{element}", "vsapi", "COMBOBOX",
+                                     part, [("disabled", 4), ("", 1)], **options)
+            for combo_style in ("TCombobox", READONLY_COMBO_STYLE):
+                text = [("Combobox.textarea", {"sticky": "nswe"})]
+                # 只读控件省略会填蓝文字区的焦点层；可编辑模型保留文字选择。
+                if combo_style == "TCombobox":
+                    text = [("Combobox.focus", {"sticky": "nswe", "children": text})]
+                style.layout(combo_style, [("CourseMate.Combobox.border", {
+                    "sticky": "nswe", "children": [
+                        ("CourseMate.Combobox.rightdownarrow", {"side": "right", "sticky": "ns"}),
+                        ("Combobox.padding", {"sticky": "nswe", "children": [
+                            ("Combobox.background", {"sticky": "nswe", "children": text})
+                        ]})
+                    ]
+                })])
+            # 补回焦点层原有的内边距，保持下拉框与输入框等高。
+            style.configure(READONLY_COMBO_STYLE, padding=3)
         # 设置页左侧分类栏。选中项加粗、变蓝、垫浅蓝底，再配左边一条竖杠
         style.configure("NavItem.TLabel", font=FONT, foreground="#333")
         style.configure("NavItemOn.TLabel", font=FONT_BOLD, foreground="#0b5cad",
@@ -603,6 +626,7 @@ class CourseMateGUI:
 
         self._build_ui()
         self._tidy_comboboxes(root)
+        root.bind_class("ComboboxPopdown", "<Unmap>", self._on_combobox_unmap, add="+")
         self._no_select_on_traverse()
         self._attach_edit_menu()
         self._start_tray()
@@ -1833,23 +1857,31 @@ class CourseMateGUI:
         self._tidy_comboboxes(row)
 
     def _tidy_comboboxes(self, widget) -> None:
-        """选完之后把文字上的蓝底选中态清掉。
-
-        ttk.Combobox 选中一项后会把文本整个选起来，留一条蓝底白字，
-        非得再点一下别处才褪掉。选都选完了，没有理由还保持选中。
-        """
+        """选完之后清掉文字选区；取消下拉由原生列表的收起事件处理。"""
         for child in widget.winfo_children():
             if isinstance(child, ttk.Combobox):
                 if child.instate(("readonly",)):
                     child.configure(style=READONLY_COMBO_STYLE)
                 child.bind("<<ComboboxSelected>>",
-                           lambda e: e.widget.after(20, self._clear_combobox_highlight,
-                                                    e.widget), add="+")
+                           lambda e: self._clear_combobox_highlight(e.widget), add="+")
             self._tidy_comboboxes(child)
+
+    def _on_combobox_unmap(self, event) -> None:
+        path = str(event.widget)
+        if not path.endswith(".popdown"):
+            return
+        try:
+            widget = self.root.nametowidget(path.removesuffix(".popdown"))
+        except (tk.TclError, KeyError):
+            return
+        self._clear_combobox_highlight(widget)
+        self.root.after_idle(self._clear_combobox_highlight, widget)
 
     def _clear_combobox_highlight(self, widget) -> None:
         try:
-            if self.root.focus_get() is widget:
+            if widget.instate(("pressed",)):
+                return
+            if str(self.root.tk.call("focus")) == str(widget):
                 self.root.focus_set()
             widget.selection_clear()
         except tk.TclError:

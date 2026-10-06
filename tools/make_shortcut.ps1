@@ -5,7 +5,7 @@ if ([string]::IsNullOrWhiteSpace($scriptPath)) {
     throw "无法确定脚本目录，未改动快捷方式。"
 }
 $root = Split-Path -Parent (Split-Path -Parent $scriptPath)
-$exe = Join-Path $root "dist\OnlineCourseAssistant-v1.0.2-windows-x64\OnlineCourseAssistant\OnlineCourseAssistant.exe"
+$exe = Join-Path $root "dist\OnlineCourseAssistant-v1.0.3-windows-x64\OnlineCourseAssistant\OnlineCourseAssistant.exe"
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw "没有找到正式发布版：$exe"
 }
