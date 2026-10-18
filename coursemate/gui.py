@@ -2743,10 +2743,12 @@ class CourseMateGUI:
             self._append_log(level, message, ts)
             if "[需要你处理]" in message:
                 self._call_user_over(message)
+            elif "[登录验证]" in message:
+                self._call_user_over(message, allow_popup=False)
             drained += 1
         self.root.after(120, self._drain_log_queue)
 
-    def _call_user_over(self, message: str) -> None:
+    def _call_user_over(self, message: str, allow_popup: bool = True) -> None:
         """把人叫回来处理需要人工的事（目前只有人机验证）。
 
         本地验证未通过时需要人工处理，"及时被发现"就是
@@ -2754,7 +2756,7 @@ class CourseMateGUI:
         光响一声铃很容易错过，而错过的每一秒都是白等。
         """
         beep = bool(getattr(self, "beep_var", None) and self.beep_var.get())
-        popup = bool(getattr(self, "captcha_popup_var", None)
+        popup = allow_popup and bool(getattr(self, "captcha_popup_var", None)
                      and self.captcha_popup_var.get())
         if not beep and not popup:
             return

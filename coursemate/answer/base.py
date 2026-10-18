@@ -54,6 +54,8 @@ class Question:
     image_data_url: str = ""
     # 独立章节测验重新进入时可能已保存答案。已有选择只记录、绝不覆盖。
     selected_keys: list[str] = field(default_factory=list)
+    # 网站已给出的错题反馈，仅作为 AI 重答依据，不参与题目身份。
+    feedback: str = ""
 
     @property
     def fingerprint(self) -> str:

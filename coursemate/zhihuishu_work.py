@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import re
 from urllib.parse import urlsplit
 
@@ -47,6 +48,41 @@ def is_homework_url(url: str) -> bool:
     return is_work_url(url) and bool(re.fullmatch(
         r"/webexamlist/dohomework(?:/[^?#]*)?", urlsplit(url).fragment.split("?", 1)[0], re.I
     ))
+
+
+def is_homework_result_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    return (host == "zhihuishu.com" or host.endswith(".zhihuishu.com")) and \
+        parsed.path.lower().endswith("/stuexamweb.html") and bool(re.fullmatch(
+            r"/webexamlist/checkhomework(?:/[^/?#]+)+/?",
+            parsed.fragment.split("?", 1)[0], re.I))
+
+
+async def read_homework_result(page: Page) -> bool:
+    """已提交平时测试的原生成绩页，不对考试页或未就绪结果认定完成。"""
+    if not is_homework_result_url(page.url):
+        return False
+    score = page.locator(".examInfo.first-info li").filter(has=page.locator("label")).first
+    total = page.locator(".examInfo li").filter(
+        has=page.locator("label", has_text=re.compile(r"^总分数$"))).first
+    try:
+        await page.wait_for_function(r"""() => {
+            const info = document.querySelector('.examInfo.first-info li');
+            const total = [...document.querySelectorAll('.examInfo li')]
+                .find(e => e.querySelector('label')?.textContent.trim() === '总分数');
+            return info?.querySelector('label')?.textContent.replace(/\s/g,'') === '得分:'
+                && /^\d+(?:\.\d+)?$/.test(info.querySelector('span')?.textContent.trim() || '')
+                && /^\d+(?:\.\d+)?$/.test(total?.querySelector('span')?.textContent.trim() || '');
+        }""", timeout=15000)
+        value, maximum = float(await score.locator("span").inner_text()), float(await total.locator("span").inner_text())
+        if not 0 <= value <= maximum or maximum <= 0:
+            return False
+    except Exception:
+        logger.warn("平时测试结果页的实际得分/总分未就绪，未记为完成，保留页面。")
+        return False
+    logger.info(f"本章平时测试已提交，结果页得分 {value:g}/{maximum:g}，无需重复作答，继续后续小节。")
+    return True
 
 
 async def _load_homeworks(page: Page, list_url: str, flag: int = 1):
@@ -167,6 +203,45 @@ async def study_tests(page: Page, provider: AnswerProvider | None, cache: Answer
     return False
 
 
+async def _protected_stem(page: Page, row) -> str:
+    """读取该题的封闭 Shadow DOM，仅取文字，不修改网页状态。"""
+    anchor = row.locator('.subject_num [id]').first
+    if not await anchor.count():
+        return ""
+    anchor_id = await anchor.get_attribute('id')
+    session = await page.context.new_cdp_session(page)
+    try:
+        root = (await session.send('DOM.getDocument', {'depth': 0}))['root']
+        node = await session.send('DOM.querySelector', {
+            'nodeId': root['nodeId'],
+            'selector': f'.examPaper_subject:has([id={json.dumps(anchor_id)}]) .subject_describe',
+        })
+        if not node['nodeId']:
+            return ""
+        described = await session.send('DOM.describeNode', {
+            'nodeId': node['nodeId'], 'depth': -1, 'pierce': True,
+        })
+        parts = []
+        def walk(item):
+            if item.get('nodeName', '').lower() in ('script', 'style'):
+                return
+            if item.get('nodeType') == 3:
+                parts.append(item['nodeValue'])
+            for child in item.get('children', []) + item.get('shadowRoots', []):
+                walk(child)
+        walk(described['node'])
+        return ' '.join(' '.join(parts).split())
+    finally:
+        await session.detach()
+
+
+async def _option_selected(label) -> bool:
+    checked = label.locator('input[type="radio"], input[type="checkbox"]').first
+    return (bool(await checked.count()) and await checked.is_checked()) or \
+        "is-checked" in ((await label.get_attribute("class")) or "").split() or \
+        bool(await label.locator(".node_detail.onChecked").count())
+
+
 async def extract_questions(page: Page, capture_image: bool = True) -> list[Question]:
     questions: list[Question] = []
     rows = page.locator(ROW_SEL)
@@ -176,6 +251,8 @@ async def extract_questions(page: Page, capture_image: bool = True) -> list[Ques
         if not await title.count():
             continue
         stem = " ".join((await title.inner_text()).split())
+        if not stem:
+            stem = await _protected_stem(page, row)
         if not stem:
             continue
         type_text = " ".join((await row.locator(".subject_type").first.inner_text()).split()) \
@@ -192,9 +269,7 @@ async def extract_questions(page: Page, capture_image: bool = True) -> list[Ques
             match = re.match(r"^([A-Z])[.、．\s]+(.+)$", raw, re.I)
             key = match.group(1).upper() if match else chr(ord("A") + option_index)
             options.append(Option(key, match.group(2) if match else raw))
-            checked = label.locator('input[type="radio"], input[type="checkbox"]').first
-            if (await checked.count() and await checked.is_checked()) or \
-                    "is-checked" in ((await label.get_attribute("class")) or "").split():
+            if await _option_selected(label):
                 selected.append(key)
         image_data_url = ""
         if capture_image:
@@ -220,8 +295,7 @@ async def fill_answer(page: Page, question: Question, keys: list[str]) -> bool:
     labels = row.locator(OPTION_SEL)
     # 页面既有答案不能覆盖，也不能靠最后的高亮假装写入成功。
     for index in range(await labels.count()):
-        checked = labels.nth(index).locator('input[type="radio"], input[type="checkbox"]').first
-        if await checked.count() and await checked.is_checked():
+        if await _option_selected(labels.nth(index)):
             return False
     for index, option in enumerate(question.options):
         if option.key in wanted:
@@ -229,8 +303,7 @@ async def fill_answer(page: Page, question: Question, keys: list[str]) -> bool:
     await asyncio.sleep(0.3)
     selected: set[str] = set()
     for index, option in enumerate(question.options):
-        checked = labels.nth(index).locator('input[type="radio"], input[type="checkbox"]').first
-        if await checked.count() and await checked.is_checked():
+        if await _option_selected(labels.nth(index)):
             selected.add(option.key)
     return selected == wanted
 
@@ -249,6 +322,49 @@ async def _save_answer_cards(page: Page, count: int) -> bool:
         await next_button.click(timeout=3000)
         await asyncio.sleep(0.2)
     return True
+
+
+async def _save_work(page: Page, button, should_stop) -> bool:
+    if should_stop():
+        return False
+    if not is_homework_url(page.url):
+        await button.click(timeout=3000)
+        logger.info("已点击页面的保存按钮；服务器是否落盘仍需在网页核对。")
+        return True
+    receipt = asyncio.create_task(page.wait_for_event(
+        "response", predicate=lambda response: response.url.split("?", 1)[0] == HOMEWORK_SAVE_API
+        and response.request.method == "POST", timeout=15000,
+    ))
+    await asyncio.sleep(0)
+    try:
+        saved_message = page.locator(".el-message:visible").filter(has_text="保存成功！").last
+        if await saved_message.count():
+            await saved_message.wait_for(state="hidden", timeout=5000)
+        if should_stop():
+            return False
+        await button.click(timeout=3000)
+        dialog = page.locator(".el-message-box__wrapper:visible").filter(has_text="你确定要暂存作业吗").last
+        for _ in range(20):
+            if should_stop():
+                return False
+            if await dialog.count() or receipt.done() or await saved_message.count():
+                break
+            await asyncio.sleep(0.25)
+        if await dialog.count():
+            await dialog.get_by_role("button", name="确定", exact=True).click(timeout=3000)
+            await dialog.wait_for(state="hidden", timeout=3000)
+        if not receipt.done() and await saved_message.count():
+            logger.info("网页提示保存成功，本次未收到新的保存回执；整卷完成仍须服务器提交确认。")
+            return not should_stop()
+        data = await (await receipt).json()
+        accepted = str(data.get("status")) == "200" and str(data.get("rt", {}).get("statu")) == "1"
+        if accepted:
+            logger.info("智慧树平时测试已取得服务器保存回执。")
+        return accepted and not should_stop()
+    finally:
+        if not receipt.done():
+            receipt.cancel()
+        await asyncio.gather(receipt, return_exceptions=True)
 
 
 async def _submit_work(page: Page, label: str, should_stop) -> bool | None:
@@ -328,16 +444,12 @@ async def study_work(page: Page, provider: AnswerProvider | None, cache: AnswerC
         if stopped():
             return False
         if attempt == 2:
-            save = page.get_by_role("button", name=re.compile(r"^(保存|保存答案)$")).first
+            save = page.locator(".switch-btn-box").get_by_role("button", name=re.compile(r"^(保存|保存答案)$")).first
+            if not await save.count():
+                save = page.get_by_role("button", name=re.compile(r"^(保存|保存答案|暂存作业)$")).first
             if await save.count() and await save.is_visible() and await save.is_enabled():
-                async with page.expect_response(
-                    lambda response: response.url.split("?", 1)[0] == HOMEWORK_SAVE_API
-                    and response.request.method == "POST", timeout=15000,
-                ) as pending:
-                    await save.click(timeout=3000)
-                data = await (await pending.value).json()
-                if str(data.get("status")) == "200" and str(data.get("rt", {}).get("statu")) == "1":
-                    logger.info("连续三轮仍有漏题，已取得保存回执；本测试不提交，保留题页并继续后续任务。", shift=True)
+                if await _save_work(page, save, stopped):
+                    logger.info("连续三轮仍有漏题，已完成网页保存操作；本测试不提交，保留题页并继续后续任务。", shift=True)
                 else:
                     logger.warn("连续三轮仍有漏题，保存未被确认；不提交，保留题页供人工检查。")
             else:
@@ -360,6 +472,15 @@ async def _study_work_round(page: Page, provider: AnswerProvider | None, cache: 
         await page.locator(ROW_SEL).first.wait_for(state="visible", timeout=12000)
     except Exception:
         logger.warn("智慧树测试/考试题目未出现；可能还在列表、需要验证或页面结构不同。")
+        return False
+    for _ in range(48):
+        if should_stop():
+            return False
+        if await extract_questions(page, capture_image=False):
+            break
+        await asyncio.sleep(0.25)
+    else:
+        logger.warn("测试题目框架已出现，但题干尚未加载，保留页面供人工检查。")
         return False
     is_exam = "doexamination" in urlsplit(page.url).fragment.lower()
     label = "考试" if is_exam else "平时测试"
@@ -420,13 +541,13 @@ async def _study_work_round(page: Page, provider: AnswerProvider | None, cache: 
         next_button = page.locator(".switch-btn-box").get_by_role("button", name="下一题", exact=True).first
         if (len(questions) != 1 or not await next_button.count()
                 or not await next_button.is_visible() or not await next_button.is_enabled()):
-            save_button = page.get_by_role("button", name=re.compile(r"^(保存|暂存|保存答案)$")).first
+            save_button = page.locator(".switch-btn-box").get_by_role("button", name=re.compile(r"^(保存|保存答案)$")).first
+            if not await save_button.count():
+                save_button = page.get_by_role("button", name=re.compile(r"^(保存|暂存|保存答案|暂存作业)$")).first
             if should_stop():
                 return False
             if await save_button.count() and await save_button.is_visible() and await save_button.is_enabled():
-                await save_button.click(timeout=3000)
-                final_saved = True
-                logger.info("已点击页面的保存按钮；服务器是否落盘仍需在网页核对。")
+                final_saved = await _save_work(page, save_button, should_stop)
             elif len(questions) == 1:
                 logger.warn("最后一题没有明确保存按钮；页面选中不等于服务器已保存，请人工核对。")
             break

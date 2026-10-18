@@ -10,15 +10,65 @@ from __future__ import annotations
 
 import asyncio
 import re
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from playwright.async_api import BrowserContext, Page
+from playwright.async_api import BrowserContext, Error as PlaywrightError, Page
 
 from ..answer.base import AnswerResult, Option, Question
 from ..logger import Logger
 from .base import Lesson, PlatformAdapter, register
 
 logger = Logger()
+
+
+async def player_pointer(page: Page, target, *, hover: bool = False, reveal=None) -> None:
+    """稳定帧等待失败时，只对视口中实际命中的播放器控件发送浏览器输入。"""
+    async def locate(control):
+        return await control.evaluate_all("""nodes => {
+            if (nodes.length !== 1) return null;
+            const el = nodes[0];
+            if (!el || el.closest(':disabled, [aria-disabled="true"]')) return null;
+            const box = el.getBoundingClientRect(), css = getComputedStyle(el);
+            const x = box.left + box.width / 2, y = box.top + box.height / 2;
+            if (!box.width || !box.height || css.visibility !== 'visible' || +css.opacity === 0
+                || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
+            for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+                if (+getComputedStyle(parent).opacity === 0) return null;
+            }
+            const hit = document.elementFromPoint(x, y);
+            return hit && (hit === el || el.contains(hit)) ? {x, y} : null;
+        }""")
+
+    try:
+        if hover:
+            await target.hover(timeout=3000)
+        else:
+            await target.click(timeout=3000)
+    except PlaywrightError as exc:
+        if page.is_closed():
+            raise
+        point = await locate(target)
+        if point is None:
+            # 控件等待期间网站会收起控制栏；先原生唤出，再重新核对目标，不能点隐藏控件。
+            center = await locate(page.locator('#vjs_container'))
+            if center is not None:
+                await page.mouse.move(center['x'], center['y'])
+                if reveal is not None:
+                    menu = await locate(reveal)
+                    if menu is not None:
+                        await page.mouse.move(menu['x'], menu['y'])
+                for _ in range(10):
+                    point = await locate(target)
+                    if point is not None:
+                        break
+                    await asyncio.sleep(.1)
+        if point is None:
+            raise
+        logger.debug(f"播放器控件改用浏览器原生{'悬停' if hover else '点击'}：{exc}")
+        if hover:
+            await page.mouse.move(point['x'], point['y'])
+        else:
+            await page.mouse.click(point['x'], point['y'])
 
 
 @register
@@ -92,6 +142,7 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     def __init__(self) -> None:
         self.is_hike = False
+        self.is_mooc = False
         self.is_shared = False
         self.confirm_catalog_progress = False
         self.ui_playback = False
@@ -108,6 +159,47 @@ class ZhihuishuAdapter(PlatformAdapter):
         self.work_page: Page | None = None
         self.course_page_lost = False
         self.course_url = ""
+        self._knowledge_busy = False
+        self._playback_recovering = False
+        self._knowledge_lessons: set[str] = set()
+        self._knowledge_done: set[str] = set()
+        self._manual_lesson_key = ""
+        self._resume_key = ""
+        self._resume_failures = 0
+        self._resume_reloaded = False
+
+    def note_manual_lesson(self, key: str) -> None:
+        self._manual_lesson_key = key
+        self._knowledge_lessons.discard(key)
+
+    async def _watch_manual_lessons(self, page: Page) -> None:
+        page._coursemate_navigation_owner = getattr(self, "_navigation_owner", self)
+        if getattr(page, "_coursemate_lesson_watched", False):
+            return
+
+        def selected(source, key):
+            owner = source["page"]._coursemate_navigation_owner
+            if owner._on_mooc_course(source["page"]):
+                owner.note_manual_lesson(key)
+
+        await page.expose_binding("coursemateSelectLesson", selected)
+        await page.add_init_script(r"""(() => {
+            if (window !== window.top || location.hostname !== 'wisdom-mooc.zhihuishu.com'
+                || location.pathname.replace(/\/$/, '') !== '/study/index') return;
+            document.addEventListener('click', event => {
+                const row = event.target.closest('.catalog-com .chapter-content-second, .catalog-com .chapter-item');
+                if (!row || row.querySelector('.chapter-content-second')) return;
+                const number = row.querySelector('.item-num')?.textContent.trim();
+                if (!number) return;
+                const key = 'video:' + number;
+                if (window.coursemateExpectedLessonClick === key) {
+                    window.coursemateExpectedLessonClick = '';
+                    return;
+                }
+                window.coursemateSelectLesson(key);
+            }, true);
+        })();""")
+        page._coursemate_lesson_watched = True
 
     @classmethod
     def match(cls, url: str) -> bool:
@@ -188,13 +280,20 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     async def open_course(self, page: Page, url: str) -> str:
         self._confirmed_tests.clear()
+        self._knowledge_lessons.clear()
+        self._knowledge_done.clear()
         self.is_hike = "hike.zhihuishu.com" in url
         parsed = urlparse(url)
         self.is_shared = (parsed.hostname or "").lower() == "studyvideoh5.zhihuishu.com" \
             and parsed.path.lower().startswith("/stustudy")
-        self.confirm_catalog_progress = self.is_shared
-        self.ui_playback = self.is_shared
-        if self.is_shared:
+        self.is_mooc = (parsed.hostname or "").lower() == "wisdom-mooc.zhihuishu.com" \
+            and parsed.path.rstrip("/").lower() == "/study/index"
+        self.confirm_catalog_progress = self.is_shared or self.is_mooc
+        self.ui_playback = self.is_shared or self.is_mooc
+        if self.is_mooc:
+            self.course_url = url
+            await self._watch_manual_lessons(page)
+        if self.is_shared or self.is_mooc:
             self.QUESTION_TITLE_SEL = "#playTopic-dialog .topic-title"
             self.QUESTION_LIST_SEL = "#playTopic-dialog .el-pager"
             self.OPTION_SEL = "#playTopic-dialog .topic-item"
@@ -210,10 +309,10 @@ class ZhihuishuAdapter(PlatformAdapter):
         if not await self.is_logged_in(page):
             logger.error("打开课程页时被跳回登录页，说明登录状态未生效。")
             return "未登录"
-        if self.is_shared:
+        if self.is_shared or self.is_mooc:
             self.course_url = page.url
 
-        title_sel = ".course-name" if self.is_hike else ".source-name"
+        title_sel = ".course-name" if self.is_hike or self.is_mooc else ".source-name"
         try:
             node = await page.wait_for_selector(title_sel, timeout=15000)
             title = (await node.text_content() or "").strip()
@@ -239,6 +338,13 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     async def prepare_page(self, page: Page) -> None:
         """关掉进入课程时的引导弹窗，否则会挡住播放器。"""
+        if self.is_mooc:
+            await self.handle_playback_notice(page)
+            notice = page.locator(".el-overlay-dialog:not(.is-closing) .ai-notice-dialog:visible .btn") \
+                .filter(has_text="好的").first
+            if await notice.count():
+                await notice.click(timeout=2000)
+            return
         if not self.is_shared:
             try:
                 if await page.locator(".courseRemind.khfaPop:visible").count():
@@ -271,7 +377,47 @@ class ZhihuishuAdapter(PlatformAdapter):
                 logger.warn("学前必读弹窗仍遮挡页面，请手动关闭。")
         # 智慧树会校验播放器行为，不覆写 video.pause/play 等原生方法。
 
+    async def handle_playback_notice(self, page: Page) -> bool:
+        """只处理已识别的多视频提示，以正常导航重新取得本页学习会话。"""
+        if (not self.is_mooc or self._knowledge_busy or self._playback_lock.locked()
+                or not self._on_mooc_course(page)):
+            return False
+        async with self._playback_lock:
+            dialog = page.locator(".el-dialog:visible").filter(
+                has_text="同时播放多个视频，其他页面的学习进度将停止记录哦！").first
+            button = dialog.locator(".btn100").filter(has_text=re.compile(r"^我知道了$"))
+            if not await dialog.count() or not await button.count():
+                return False
+            # 验证/弹题留给原流程，不能借恢复播放器跳过尚未完成的内容。
+            if await self.detect_captcha(page) or await self.detect_question(page):
+                return False
+            self._playback_recovering = True
+            try:
+                active_key = await self.active_lesson_key(page)
+                await button.click(timeout=3000)
+                await dialog.wait_for(state="hidden", timeout=3000)
+                from ..zhihuishu_knowledge import pause_video
+
+                for other in page.context.pages:
+                    if other is not page and self._on_mooc_course(other):
+                        await pause_video(other)
+                await pause_video(page)
+                await page.reload(wait_until="domcontentloaded", timeout=45000)
+                await page.locator(".catalog-com .chapter-item").first.wait_for(timeout=20000)
+                lesson = next((item for item in await self.list_lessons(page)
+                               if item.key == active_key), None)
+                if lesson is None or not await self.enter_lesson(page, lesson):
+                    raise RuntimeError("已确认多视频提示，但恢复原小节失败")
+                if lesson.finished:
+                    await pause_video(page)
+                logger.info(f"已处理播放会话冲突提示并重新载入《{lesson.title}》，等待播放器及目录核对。")
+                return True
+            finally:
+                self._playback_recovering = False
+
     async def list_lessons(self, page: Page) -> list[Lesson]:
+        if self.is_mooc:
+            return await self._list_mooc_lessons(page)
         sel = await self._resolve_lesson_selector(page)
         if not sel:
             logger.error(
@@ -310,7 +456,40 @@ class ZhihuishuAdapter(PlatformAdapter):
                                   finished=finished, key=str(index), kind=kind))
         return lessons
 
+    async def _list_mooc_lessons(self, page: Page) -> list[Lesson]:
+        self.lesson_sel = (".catalog-com .chapter-item:not(:has(.chapter-content-second)), "
+                           ".catalog-com .chapter-content-second, .catalog-com .test-box")
+        await page.locator(self.lesson_sel).first.wait_for(state="attached", timeout=30000)
+        rows = page.locator(self.lesson_sel)
+        # 完成时进度圈会被图标替换；一次读取快照，不能先 count 再等待已消失的控件。
+        snapshot = await rows.evaluate_all("""nodes => nodes.map(row => {
+            const group = row.closest('.el-collapse-item');
+            if (row.classList.contains('test-box')) {
+                const number = group?.querySelector('.item-num')?.textContent.trim().split('.')[0] || '';
+                const label = group?.querySelector('.chapter-title, .el-collapse-item__header')?.textContent.trim() || '';
+                return {key: 'chapter:' + number, title: label + ' 测试', kind: 'chapter', finished: false};
+            }
+            const root = row.querySelector(':scope > .item-box') || row;
+            const number = root.querySelector('.item-num')?.textContent.trim();
+            const name = root.querySelector('.item-name')?.textContent.trim();
+            if (!number || !name) return null;
+            const finished = !!root.querySelector('.finish-icon')
+                || root.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow') === '100';
+            return {key: 'video:' + number, title: number + ' ' + name, kind: 'video', finished};
+        })""")
+        if not snapshot or any(item is None for item in snapshot):
+            raise RuntimeError("课程目录正在重绘，尚未读到完整小节")
+        lessons = []
+        for index, item in enumerate(snapshot):
+            finished = item['finished'] or (item['kind'] == 'chapter' and item['key'] in self._confirmed_tests)
+            lessons.append(Lesson(item['title'], rows.nth(index), finished, item['key'], item['kind']))
+        return lessons
+
     async def active_lesson_key(self, page: Page) -> str:
+        if self.is_mooc:
+            current = page.locator(".catalog-com .chapter-content-second.current .item-num, "
+                                   ".catalog-com .chapter-item.current > .item-box > .item-num").first
+            return await current.evaluate_all("nodes => nodes.length ? 'video:' + nodes[0].textContent.trim() : ''")
         if not self.lesson_sel:
             return ""
         handles = await page.query_selector_all(self.lesson_sel)
@@ -329,6 +508,8 @@ class ZhihuishuAdapter(PlatformAdapter):
     async def ensure_playing(self, page: Page) -> bool:
         """仅通过播放器可见控件续播，不注入 play/pause 守卫。"""
         async with self._playback_lock:
+            if self._knowledge_busy or (self.is_mooc and not self._on_mooc_course(page)):
+                return False
             if self.work_page is not None and self.work_page is not page:
                 return False
             if await self.detect_question(page) or await self.detect_captcha(page):
@@ -341,12 +522,33 @@ class ZhihuishuAdapter(PlatformAdapter):
                        and not item.finished for item in lessons):
                 return False
             video = page.locator("video").first
-            if not await video.count() or not await video.evaluate(
-                "v => v.paused && !v.ended && !v.__coursemateManualHold"
-            ):
+            if not await video.count():
                 return False
+            if self._resume_key != active_key:
+                self._resume_key = active_key
+                self._resume_failures = 0
+                self._resume_reloaded = False
+            if await video.evaluate("v => v.ended || v.__coursemateManualHold"):
+                return False
+            lesson = next(item for item in lessons if item.key == active_key)
+            if not await video.evaluate("v => v.paused"):
+                if self._resume_failures:
+                    advanced = await self._playback_advanced(page, video)
+                    if await self.active_lesson_key(page) != active_key:
+                        return False
+                    if advanced:
+                        self._resume_succeeded(lesson)
+                    else:
+                        await self._resume_failed(page, lesson, ["播放器未暂停，但媒体时间仍未前进"])
+                return False
+            details = []
             player = page.locator("#vjs_container").first
-            await (player if await player.count() else video).hover(timeout=2000)
+            try:
+                await (player if await player.count() else video).hover(timeout=2000)
+            except PlaywrightError as exc:
+                if page.is_closed():
+                    raise
+                details.append(f"悬停播放器：{exc}")
             for selector in ("#playButton .bigPlayButton, .bigPlayButton.pointer",
                              "#playButton", ".vjs-big-play-button", ".vjs-play-control"):
                 button = page.locator(selector).first
@@ -356,26 +558,120 @@ class ZhihuishuAdapter(PlatformAdapter):
                     "v => v.paused && !v.ended && !v.__coursemateManualHold"
                 ):
                     return False
-                handle = await video.element_handle()
-                before = await video.evaluate("v => v.currentTime")
-                await button.click(timeout=2000)
                 try:
-                    await page.wait_for_function(
-                        "([v, before]) => v.isConnected && !v.paused && !v.ended "
-                        "&& v.currentTime > before + 0.05",
-                        arg=[handle, before], timeout=2000,
-                    )
-                    return await self.active_lesson_key(page) == active_key
-                except Exception:
-                    if not await video.evaluate("v => v.paused"):
-                        return False
+                    await button.click(timeout=2000)
+                except PlaywrightError as exc:
+                    if page.is_closed():
+                        raise
+                    details.append(f"点击 {selector}：{exc}")
+                    # 后台页面可能等不到逐帧稳定检查；仅点击当前可见且实际命中的原生按钮。
+                    point = await button.evaluate_all("""nodes => {
+                        const el = nodes[0];
+                        if (!el || el.closest(':disabled, [aria-disabled="true"]')) return null;
+                        const box = el.getBoundingClientRect(), css = getComputedStyle(el);
+                        const x = box.left + box.width / 2, y = box.top + box.height / 2;
+                        if (!box.width || !box.height || css.visibility !== 'visible' || +css.opacity === 0
+                            || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
+                        const hit = document.elementFromPoint(x, y);
+                        return hit && (hit === el || el.contains(hit)) ? {x, y} : null;
+                    }""")
+                    if (point and await self.active_lesson_key(page) == active_key
+                            and not await self.detect_question(page) and not await self.detect_captcha(page)
+                            and await video.evaluate("v => v.paused && !v.ended && !v.__coursemateManualHold")):
+                        await page.mouse.click(point["x"], point["y"])
+                    else:
+                        continue
+                if await self._playback_advanced(page, video):
+                    if await self.active_lesson_key(page) == active_key:
+                        self._resume_succeeded(lesson)
+                        return True
+                    return False
+                details.append(f"点击 {selector} 后视频时间未前进")
+                if not await video.evaluate("v => v.paused"):
+                    break
+            await self._resume_failed(page, lesson, details)
             return False
 
+    async def _playback_advanced(self, page: Page, video) -> bool:
+        handle = await video.element_handle()
+        before = await video.evaluate("v => v.currentTime")
+        try:
+            await page.wait_for_function(
+                "([v, before]) => v.isConnected && !v.paused && !v.ended && v.currentTime > before + .05",
+                arg=[handle, before], polling=100, timeout=2000,
+            )
+            return True
+        except PlaywrightError:
+            if page.is_closed():
+                raise
+            return False
+        finally:
+            if handle is not None:
+                await handle.dispose()
+
+    def _resume_succeeded(self, lesson: Lesson) -> None:
+        if self._resume_failures:
+            logger.info(f"续播恢复 [{lesson.title}]：已确认视频时间继续前进。")
+        self._resume_failures = 0
+        self._resume_reloaded = False
+
+    async def _resume_failed(self, page: Page, lesson: Lesson, details: list[str]) -> None:
+        if await self.active_lesson_key(page) != lesson.key:
+            return
+        self._resume_failures += 1
+        if self._resume_failures in (1, 3) or (self._resume_reloaded and self._resume_failures == 4):
+            logger.debug(f"续播操作详情 [{lesson.title}]：" + "\n".join(details or ["未找到可操作的播放按钮"]))
+        if self._resume_reloaded and self._resume_failures == 4:
+            logger.warn(f"续播异常 [{lesson.title}]：重新载入后仍未恢复，已保留页面供检查，不再重复重载。")
+        if self._resume_failures != 3:
+            return
+        from ..verification import has_verification
+
+        blocked = (await self.detect_question(page) or await self.detect_captcha(page)
+                   or await has_verification(page) or await page.locator(
+                       '.el-overlay:visible, .el-dialog:visible, [role="dialog"]:visible, .el-message-box:visible').count())
+        if blocked:
+            logger.warn(f"续播异常 [{lesson.title}]：连续 3 次未恢复，页面仍有弹窗或验证浮层，已保留现场供检查。")
+            return
+        if not self.is_mooc or not self._on_mooc_course(page) or self._resume_reloaded:
+            logger.warn(f"续播异常 [{lesson.title}]：连续 3 次未恢复，已保留页面，详细失败原因已记入日志。")
+            return
+        if (self._manual_lesson_key or self._knowledge_busy
+                or await page.locator('video').first.evaluate('v => v.__coursemateManualHold')):
+            return
+        self._resume_reloaded = True
+        self._playback_recovering = True
+        logger.warn(f"续播异常 [{lesson.title}]：连续 3 次未恢复，尝试重新载入当前小节一次；详细失败原因已记入日志。")
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=45000)
+            target = self._manual_lesson_key or lesson.key
+            current = next((item for item in await self.list_lessons(page) if item.key == target), None)
+            if current is None or not await self.enter_lesson(page, current):
+                logger.warn(f"续播恢复 [{lesson.title}]：重载后未确认原小节，保留页面，未跳到其他节。")
+                return
+            if current.finished:
+                from ..zhihuishu_knowledge import pause_video
+
+                await pause_video(page)
+            logger.info(f"续播恢复 [{current.title}]：已重新载入同一小节，等待实际播放核对。")
+        except PlaywrightError as exc:
+            if page.is_closed():
+                raise
+            logger.warn(f"续播恢复 [{lesson.title}]：重载未成功，保留页面供检查。")
+            logger.debug(f"续播重载详情 [{lesson.title}]：{exc}")
+        finally:
+            self._playback_recovering = False
+
     async def tune_playback(self, page: Page, speed: float, mute: bool) -> None:
-        """智慧树仅使用页面提供的倍速档；静音由浏览器启动参数处理。"""
+        """仅使用页面提供的倍速档；新版播放器另落实媒体元素静音。"""
+        if (self._knowledge_busy or self._playback_recovering
+                or (self.is_mooc and not self._on_mooc_course(page))):
+            return
         video = page.locator("video").first
         if not await video.count():
             return
+        if self.is_mooc and mute:
+            await video.evaluate("v => { v.muted = true; v.volume = 0; }")
         current = await video.evaluate("v => v.playbackRate")
         if abs(current - speed) < 0.01:
             return
@@ -389,8 +685,69 @@ class ZhihuishuAdapter(PlatformAdapter):
             return
         box = page.locator(".speedBox").first
         if await box.count():
-            await box.hover(timeout=3000)
-        await option.click(timeout=3000)
+            await player_pointer(page, box, hover=True)
+        await player_pointer(page, option, reveal=box)
+
+    def _on_mooc_course(self, page: Page) -> bool:
+        current, course = urlparse(page.url), urlparse(self.course_url)
+        course_id = parse_qs(course.query).get("recruitAndCourseId")
+        return (current.hostname == course.hostname == "wisdom-mooc.zhihuishu.com"
+                and current.path.rstrip("/") == "/study/index"
+                and bool(course_id) and parse_qs(current.query).get("recruitAndCourseId") == course_id)
+
+    async def process_lesson_knowledge(self, page: Page, lesson: Lesson,
+                                       provider, should_stop) -> bool:
+        if not self.is_mooc or lesson.kind != "video" or lesson.key in self._knowledge_lessons:
+            return True
+        if provider is None:
+            logger.warn("知识点练习需要 AI，未配置可用 AI 时不自动作答。")
+            return False
+        from ..zhihuishu_knowledge import MENU, pause_video, pending_entries, process_lesson
+
+        await self.handle_playback_notice(page)
+        self._knowledge_lessons.add(lesson.key)
+        original = None
+        stage = "暂停当前视频"
+        try:
+            async with self._playback_lock:
+                self._knowledge_busy = True
+                await pause_video(page)
+            lessons = await self.list_lessons(page)
+            active = await self.active_lesson_key(page)
+            original = next((item for item in lessons if item.key == active), None)
+            current = next((item for item in lessons if item.key == lesson.key), None)
+            stage = "进入待查小节"
+            if current is None or should_stop() or not await self.enter_lesson(page, current):
+                return False
+            stage = "暂停待查小节"
+            await pause_video(page)
+            stage = "读取知识点菜单"
+            await page.locator(MENU).first.wait_for(state="attached", timeout=15000)
+            if not await pending_entries(page):
+                logger.info(f"知识点检查 [{lesson.title}]：均免考或已达 100%，继续后续小节。")
+                return True
+            stage = "处理知识点练习及恢复课程"
+            return await process_lesson(page, self, lesson, provider, should_stop)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warn(f"知识点检查 [{lesson.title}] 在{stage}未完成：{Logger.summarize(exc)}")
+            logger.debug(f"知识点检查详情 [{lesson.title}／{stage}]：{exc}")
+            return False
+        finally:
+            try:
+                # 补查已完成小节依目录顺序前进；用户原本正在听的未完成小节才还原。
+                if (not should_stop() and not self._manual_lesson_key
+                        and original is not None and not original.finished
+                        and self._on_mooc_course(page)
+                        and await self.active_lesson_key(page) != original.key):
+                    current = next((item for item in await self.list_lessons(page)
+                                    if item.key == original.key), None)
+                    if current is None or not await self.enter_lesson(page, current):
+                        raise RuntimeError("知识点检查后恢复原未完成小节失败")
+                    await pause_video(page)
+            finally:
+                self._knowledge_busy = False
 
     async def _resolve_lesson_selector(self, page: Page) -> str:
         """逐个试候选选择器，返回第一个真能选出元素的。
@@ -428,7 +785,34 @@ class ZhihuishuAdapter(PlatformAdapter):
         return ""
 
     async def enter_lesson(self, page: Page, lesson: Lesson) -> bool:
+        owner = getattr(self, "_navigation_owner", self)
+        if owner._manual_lesson_key and owner._manual_lesson_key != lesson.key:
+            return False
         await self.prepare_page(page)
+        if self.is_mooc:
+            header_handle = await lesson.handle.evaluate_handle("""el =>
+                el.closest('.el-collapse-item')?.querySelector('.el-collapse-item__header')
+            """)
+            header = header_handle.as_element()
+            if header and await header.get_attribute("aria-expanded") == "false":
+                await header.click(timeout=3000)
+            if lesson.kind == "chapter":
+                number = lesson.key.removeprefix("chapter:")
+                self._chapter_test_rank = int(number) if number.isdecimal() else None
+                self._chapter_test_key = lesson.key
+                before = set(page.context.pages)
+                await lesson.handle.click(timeout=10000)
+                for _ in range(40):
+                    opened = [tab for tab in page.context.pages if tab not in before]
+                    if opened:
+                        self.work_page = opened[-1]
+                        return True
+                    if page.url != self.course_url:
+                        self.work_page = page
+                        return True
+                    await page.wait_for_timeout(250)
+                logger.warn("新版章节测试未打开题页，保留未完成状态。")
+                return False
         if lesson.kind == "chapter":
             self._chapter_test_key = lesson.key
             self._chapter_test_rank = None
@@ -457,11 +841,22 @@ class ZhihuishuAdapter(PlatformAdapter):
             self.work_page = opened[-1] if opened else page
             return True
         try:
-            await lesson.handle.click(timeout=10000)
+            # 新版重点击当前节会清掉网页计时器，但视频不一定重新触发播放事件。
+            if not self.is_mooc or await self.active_lesson_key(page) != lesson.key:
+                if owner._manual_lesson_key and owner._manual_lesson_key != lesson.key:
+                    return False
+                if self.is_mooc:
+                    await page.evaluate("key => window.coursemateExpectedLessonClick = key", lesson.key)
+                try:
+                    await lesson.handle.click(timeout=10000)
+                finally:
+                    if self.is_mooc:
+                        await page.evaluate("window.coursemateExpectedLessonClick = ''")
         except Exception as exc:
             logger.warn(f"点击小节失败：{Logger.summarize(exc)}")
             return False
         markers = (
+            ("current",) if self.is_mooc else
             (self.HIKE_LESSON_ACTIVE,) if self.is_hike else self.LESSON_ACTIVE_MARKERS
         )
         try:
@@ -471,7 +866,7 @@ class ZhihuishuAdapter(PlatformAdapter):
         except Exception:
             # 等不到高亮标记不代表进不去，继续用 video 是否出现来判断
             pass
-        if self.is_shared:
+        if self.is_shared or self.is_mooc:
             for _ in range(16):
                 if await self.active_lesson_key(page) == lesson.key:
                     break
@@ -490,15 +885,28 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     async def process_chapter_test(self, page: Page, provider, cache, use_cache: bool,
                                    auto_submit: bool, should_stop) -> bool:
-        from ..zhihuishu_work import is_work_list_url, study_tests
+        from ..zhihuishu_work import (is_homework_url, is_homework_result_url,
+                                     is_work_list_url, is_work_url, read_homework_result, study_tests)
 
         work_page = self.work_page or page
         try:
+            try:
+                await work_page.wait_for_url(lambda url: is_work_list_url(str(url))
+                    or is_homework_url(str(url)) or is_homework_result_url(str(url))
+                    or is_work_url(str(url)), wait_until="domcontentloaded", timeout=15000)
+            except Exception as exc:
+                logger.warn(f"平时测试入口尚未到达可识别页面，保留供检查，继续后续小节：{Logger.summarize(exc)}")
+                return False
             if is_work_list_url(work_page.url) and self._chapter_test_rank is None:
                 logger.warn("未识别课程目录的章号，未选择其他章的平时测试。")
                 return False
-            processed = await study_tests(work_page, provider, cache, use_cache, should_stop,
-                                          target_rank=self._chapter_test_rank)
+            if should_stop():
+                return False
+            if is_homework_result_url(work_page.url):
+                processed = await read_homework_result(work_page)
+            else:
+                processed = await study_tests(work_page, provider, cache, use_cache, should_stop,
+                                              target_rank=self._chapter_test_rank)
             if processed:
                 self._confirmed_tests.add(self._chapter_test_key)
                 if work_page is not page and not work_page.is_closed():
@@ -523,6 +931,17 @@ class ZhihuishuAdapter(PlatformAdapter):
 
         读不到就退回按视频播放比例估算——刷课主线不能因为读不到进度就停摆。
         """
+        if self.is_mooc:
+            active = await self.active_lesson_key(page)
+            for lesson in await self.list_lessons(page):
+                if lesson.key != active:
+                    continue
+                progress = await lesson.handle.locator('[role="progressbar"]').evaluate_all(
+                    "nodes => nodes[0]?.getAttribute('aria-valuenow') ?? null")
+                if progress is not None:
+                    return f"{progress}%"
+                return "100%" if lesson.finished else "0%"
+            return ""
         for sel in (".percent", ".study-percent", ".progress-num"):
             try:
                 node = await page.query_selector(sel)
@@ -549,9 +968,11 @@ class ZhihuishuAdapter(PlatformAdapter):
         共享课优先看目录完成标记；高亮移走可能是用户手动切课，不能当完成。
         其他旧播放页保留原有高亮判据，视频播到末尾作兜底。
         """
-        if self.is_shared and await self.confirm_lesson_completion(page, lesson):
+        if (self.is_shared or self.is_mooc) and await self.confirm_lesson_completion(page, lesson):
             return True
-        if not self.is_shared:
+        if self.is_mooc and await self.active_lesson_key(page) != lesson.key:
+            return False
+        if not self.is_shared and not self.is_mooc:
             markers = ((self.HIKE_LESSON_ACTIVE,) if self.is_hike
                        else self.LESSON_ACTIVE_MARKERS)
             cls = await lesson.handle.get_attribute("class") or ""
@@ -570,6 +991,11 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     async def detect_question(self, page: Page) -> bool:
         try:
+            if self.is_mooc and await page.locator(
+                ".ai-class-exercise-dialog:visible, "
+                ".el-overlay-dialog:not(.is-closing) .ai-notice-dialog:visible"
+            ).count():
+                return True
             dialog = page.locator(self.POPUP_SEL).first
             if await dialog.count():
                 return await dialog.is_visible() and bool(await dialog.locator(".topic-title").count())
@@ -585,6 +1011,9 @@ class ZhihuishuAdapter(PlatformAdapter):
         智慧树的弹题可能一次弹多道，用 .number 逐题切换，
         每次切换后重新读取当前题干与选项。
         """
+        if self.is_mooc and await page.locator(".ai-class-exercise-dialog").first.is_visible():
+            from ..zhihuishu_mooc import extract_questions
+            return await extract_questions(page)
         questions: list[Question] = []
         try:
             container = await page.query_selector(self.QUESTION_LIST_SEL)
@@ -767,6 +1196,8 @@ class ZhihuishuAdapter(PlatformAdapter):
         共享课必须看到明确判对标记；错题也可以手动关闭弹窗。
         其他播放页仍保留弹窗消失的判据。
         """
+        if self.is_mooc and not await page.locator(self.POPUP_SEL).first.is_visible():
+            return "unknown"
         await asyncio.sleep(0.8)  # 给平台一点渲染反馈的时间
 
         # 1. 弹窗消失 = 这题过了
@@ -849,6 +1280,11 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     async def close_question(self, page: Page) -> None:
         """关闭弹窗。Escape 是智慧树最稳的关闭方式。"""
+        if self.is_mooc and await page.locator(".ai-class-exercise-dialog").first.is_visible():
+            completed = page.locator(".ai-class-exercise-dialog .el-dialog__footer .is-finish")
+            if await completed.count():
+                await page.locator(".ai-class-exercise-dialog .header-icon").click(timeout=2000)
+            return
         dialog = page.locator(self.POPUP_SEL).first
         if await dialog.count() and await dialog.is_visible():
             result = dialog.locator(

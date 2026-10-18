@@ -160,6 +160,9 @@ async def playback_worker(page: Page, adapter: PlatformAdapter) -> None:
     """
     while True:
         try:
+            notice = getattr(adapter, "handle_playback_notice", None)
+            if notice is not None:
+                await notice(page)
             frame = await adapter.video_frame(page)
             completed = getattr(adapter, "video_task_completed", None)
             if completed is not None and await completed(page):
@@ -536,6 +539,15 @@ async def _handle_question_popup(
     cache: AnswerCache,
 ) -> None:
     if not config.answer_enabled:
+        return
+    if (getattr(adapter, "is_mooc", False)
+            and await page.locator(".ai-class-exercise-dialog:visible, "
+                                   ".el-overlay-dialog:not(.is-closing) .ai-notice-dialog:visible").count()):
+        await adapter.prepare_page(page)
+        if not await page.locator(".ai-class-exercise-dialog").first.is_visible():
+            return
+        from .zhihuishu_mooc import process_popup
+        await process_popup(page, adapter, config, provider, cache)
         return
     questions = await adapter.extract_questions(page)
     if not questions:

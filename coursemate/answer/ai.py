@@ -61,6 +61,8 @@ def _render(question: Question) -> str:
     if question.options:
         lines.append("选项：")
         lines.extend(f"  {opt.key}. {opt.text}" for opt in question.options)
+    if question.feedback:
+        lines.append("网站作答反馈（请据此重新判断，不能重复已判错的选项组合）：\n" + question.feedback)
     return "\n".join(lines)
 
 

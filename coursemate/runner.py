@@ -34,6 +34,7 @@ from .workers import (
     tuning_worker,
 )
 from .zhihuishu_work import is_homework_url, is_work_list_url, is_work_url, study_tests, study_work
+from .zhihuishu_knowledge import is_knowledge_url
 from .verification import has_verification, wait_verification
 
 logger = Logger()
@@ -63,6 +64,9 @@ async def wait_for_video_question(page: Page, adapter: PlatformAdapter,
     while True:
         if should_stop():
             raise StopRequested
+        if getattr(adapter, "_playback_recovering", False):
+            await asyncio.sleep(0.1)
+            continue
         if not await detect_question(page):
             return
         if not waiting:
@@ -110,7 +114,7 @@ async def ensure_login(
 
                     if await asyncio.wait_for(verification_visible(), timeout=0.25):
                         logger.warn(
-                            f"[需要你处理] {adapter.name}登录页出现安全验证，尝试本地处理；超过等待时限将跳过当前地址。",
+                            f"[登录验证] {adapter.name}登录页出现安全验证，尝试本地处理；超过等待时限将跳过当前地址。",
                             shift=True,
                         )
                         captcha_notified = True
@@ -226,12 +230,48 @@ async def study_course(
     logger.info(f"共 {len(lessons)} 节，其中 {len(pending)} 节待完成。")
     if not pending:
         logger.info("所有小节均已标记完成，无需重复播放。")
-        return True
+
+    knowledge_handler = getattr(adapter, "process_lesson_knowledge", None)
+    knowledge_complete = True
+
+    async def check_knowledge(lesson):
+        # None 表示手动切课打断，不能把它记成练习失败或课程结束。
+        if getattr(adapter, "_manual_lesson_key", ""):
+            return None
+        task = asyncio.create_task(knowledge_handler(page, lesson, provider, should_stop))
+        try:
+            while not task.done():
+                if getattr(adapter, "_manual_lesson_key", ""):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    adapter._knowledge_lessons.discard(lesson.key)
+                    return None
+                await asyncio.wait({task}, timeout=.1)
+            if getattr(adapter, "_manual_lesson_key", ""):
+                return None
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     active_key = await adapter.active_lesson_key(page)
     index = next((i for i, item in enumerate(lessons) if item.key == active_key), 0)
     if lessons[index].finished:
         index = next((i for i, item in enumerate(lessons) if not item.finished), index)
+
+    # 起点之前的已完成视频也可能留下未做知识点，先补查再继续原学习位置。
+    if config.answer_enabled and provider is not None and knowledge_handler is not None:
+        for lesson in lessons[:index]:
+            if should_stop():
+                raise StopRequested
+            if lesson.finished:
+                result = await check_knowledge(lesson)
+                if should_stop():
+                    raise StopRequested
+                if result is None:
+                    break
+                knowledge_complete = result and knowledge_complete
 
     attempts: dict[str, int] = {}
     while True:
@@ -242,6 +282,27 @@ async def study_course(
         lessons = await adapter.list_lessons(page)
         if should_stop():
             raise StopRequested
+        manual = getattr(adapter, "_manual_lesson_key", "")
+        if manual:
+            moved_to = next((i for i, item in enumerate(lessons) if item.key == manual), None)
+            if moved_to is not None:
+                index = moved_to
+                if await adapter.active_lesson_key(page) != manual:
+                    if not await adapter.enter_lesson(page, lessons[index]):
+                        continue
+                # 收尾期间可能再次切课，以最后一次选择为准。
+                if adapter._manual_lesson_key != manual:
+                    continue
+                adapter._manual_lesson_key = ""
+                adapter._knowledge_lessons.discard(manual)
+                logger.info(f"检测到你手动切换章节，已从《{lessons[index].title}》接着处理。", shift=True)
+                if config.answer_enabled and provider is not None and knowledge_handler is not None:
+                    result = await check_knowledge(lessons[index])
+                    if should_stop():
+                        raise StopRequested
+                    if result is None:
+                        continue
+                    knowledge_complete = result and knowledge_complete
         if index >= len(lessons):
             if not confirm_progress:
                 break
@@ -252,6 +313,13 @@ async def study_course(
                 break
         lesson = lessons[index]
         if lesson.finished:
+            if config.answer_enabled and provider is not None and knowledge_handler is not None:
+                result = await check_knowledge(lesson)
+                if should_stop():
+                    raise StopRequested
+                if result is None:
+                    continue
+                knowledge_complete = result and knowledge_complete
             index += 1
             continue
 
@@ -267,6 +335,11 @@ async def study_course(
                              if item.key == active_key), None)
             if moved_to is not None:
                 index = moved_to
+                note_manual = getattr(adapter, "note_manual_lesson", None)
+                if note_manual is not None:
+                    if not adapter._manual_lesson_key:
+                        note_manual(active_key)
+                    continue
                 logger.info(
                     f"检测到你手动切换章节，已从《{lessons[index].title}》接着处理。",
                     shift=True,
@@ -292,6 +365,13 @@ async def study_course(
             if should_stop():
                 raise StopRequested
             await wait_for_video_question(page, adapter, should_stop)
+            if config.answer_enabled and provider is not None and knowledge_handler is not None:
+                result = await check_knowledge(lesson)
+                if should_stop():
+                    raise StopRequested
+                if result is None:
+                    continue
+                knowledge_complete = result and knowledge_complete
             if config.answer_enabled and await adapter.open_chapter_test(page):
                 if should_stop():
                     raise StopRequested
@@ -316,6 +396,10 @@ async def study_course(
         elif reason == "skipped":
             logger.info("文档课件未能完成，已跳过。" if lesson.kind in ("ppt", "pdf") else "非视频任务点，已跳过。")
         index += 1
+
+    if not knowledge_complete:
+        logger.warn("部分知识点练习未确认提交，页面已保留，未记为全部完成。")
+        return False
 
     if confirm_progress:
         remaining = [item for item in await adapter.list_lessons(page) if not item.finished]
@@ -541,7 +625,8 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
                         completed = False
                         retain_failure_page = retain_failure_page or not verification_skipped
                         if not verification_skipped and any(
-                            tab is not page and (is_homework_url(tab.url) or is_work_list_url(tab.url))
+                            tab is not page and (is_homework_url(tab.url) or is_work_list_url(tab.url)
+                                                 or is_knowledge_url(tab.url))
                             for tab in context.pages
                         ):
                             retained_contexts.add(context)
