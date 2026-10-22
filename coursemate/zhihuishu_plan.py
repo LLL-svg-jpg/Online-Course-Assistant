@@ -262,10 +262,24 @@ class CoursePlan:
                 logger.info(f"智慧树计划 [{self.title}]：日期或学习周期变化，已暂停，等待重新核对。")
                 return True
             # 先执行课程问答，避免提问和回答被长时间补时挡住。
-            if self.config.zhihuishu_questions_enabled or getattr(self.config, "zhihuishu_answers_enabled", False):
-                qa = await open_menu_page(page, "课程问答")
+            for enabled, publish, target, label in (
+                    (self.config.zhihuishu_questions_enabled, publish_questions,
+                     getattr(self.config, "zhihuishu_question_count", 5), "提问"),
+                    (getattr(self.config, "zhihuishu_answers_enabled", False), publish_answers,
+                     getattr(self.config, "zhihuishu_answer_count", 5), "回答")):
+                if not enabled:
+                    continue
+                def stopped():
+                    return (should_stop() or now().date().isoformat() != self.day
+                            or now() > datetime.fromisoformat(self.record["period"][1]))
+                if stopped():
+                    interactions_ok = False
+                    break
+                qa = None
                 success = False
                 try:
+                    # 每项使用独立问答页，失败表单留给用户检查，不挡住后续回答。
+                    qa = await open_menu_page(page, "课程问答")
                     parsed = urlparse(qa.url)
                     route, _, query = parsed.fragment.partition("?")
                     identity = self.record["report_identity"]
@@ -275,26 +289,16 @@ class CoursePlan:
                     await qa.locator(".ask-btn").wait_for(state="visible", timeout=15000)
                     await qa.get_by_role("heading", name=self.title, exact=True).wait_for(
                         state="visible", timeout=15000)
-                    success = True
-                    def stopped():
-                        return (should_stop() or now().date().isoformat() != self.day
-                                or now() > datetime.fromisoformat(self.record["period"][1]))
-                    if self.config.zhihuishu_questions_enabled:
-                        success = await publish_questions(qa, provider, self.record,
-                            self.config.zhihuishu_question_count, self.title, self.topics,
-                            self.store.save, now().date().isoformat(), stopped)
-                    if success and getattr(self.config, "zhihuishu_answers_enabled", False):
-                        success = await publish_answers(qa, provider, self.record,
-                            self.config.zhihuishu_answer_count, self.title, self.topics,
-                            self.store.save, now().date().isoformat(), stopped)
+                    success = await publish(qa, provider, self.record, target, self.title, self.topics,
+                        self.store.save, now().date().isoformat(), stopped)
                 except Exception as exc:
                     success = False
-                    logger.log_exception(f"AI 课程问答 [{self.title}]：本轮未完成，继续独立的每日补时。", exc)
+                    logger.log_exception(f"AI {label} [{self.title}]：本轮未完成，继续独立的后续计划。", exc)
                 finally:
-                    if success and not qa.is_closed():
+                    if qa is not None and success and not qa.is_closed():
                         await qa.close()
-                    elif not qa.is_closed():
-                        logger.warn(f"AI 课程问答 [{self.title}]：页面已保留供检查。")
+                    elif qa is not None and not qa.is_closed():
+                        logger.warn(f"AI {label} [{self.title}]：页面已保留供检查。")
                 if not success:
                     interactions_ok = False
         finally:

@@ -21,24 +21,35 @@ from .base import Lesson, PlatformAdapter, register
 logger = Logger()
 
 
-async def player_pointer(page: Page, target, *, hover: bool = False, reveal=None) -> None:
-    """稳定帧等待失败时，只对视口中实际命中的播放器控件发送浏览器输入。"""
-    async def locate(control):
-        return await control.evaluate_all("""nodes => {
+async def _player_point(control):
+    return await control.evaluate_all("""nodes => {
             if (nodes.length !== 1) return null;
             const el = nodes[0];
             if (!el || el.closest(':disabled, [aria-disabled="true"]')) return null;
             const box = el.getBoundingClientRect(), css = getComputedStyle(el);
-            const x = box.left + box.width / 2, y = box.top + box.height / 2;
             if (!box.width || !box.height || css.visibility !== 'visible' || +css.opacity === 0
-                || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
+                || box.right <= 0 || box.bottom <= 0 || box.left >= innerWidth || box.top >= innerHeight) return null;
             for (let parent = el.parentElement; parent; parent = parent.parentElement) {
                 if (+getComputedStyle(parent).opacity === 0) return null;
             }
-            const hit = document.elementFromPoint(x, y);
-            return hit && (hit === el || el.contains(hit)) ? {x, y} : null;
+            const left = Math.max(0, box.left), right = Math.min(innerWidth, box.right);
+            const top = Math.max(0, box.top), bottom = Math.min(innerHeight, box.bottom);
+            for (const fy of [.5, .1, .9]) for (const fx of [.5, .1, .9]) {
+                const x = left + (right-left)*fx, y = top + (bottom-top)*fy;
+                const hit = document.elementFromPoint(x, y);
+                if (hit && (hit === el || el.contains(hit))) return {x, y};
+            }
+            return null;
         }""")
 
+
+async def player_pointer(page: Page, target, *, hover: bool = False, reveal=None) -> None:
+    """只对视口中实际命中的播放器控件发送浏览器输入，不穿透遮挡。"""
+    if hover:
+        point = await _player_point(target)
+        if point is not None:
+            await page.mouse.move(point['x'], point['y'])
+            return
     try:
         if hover:
             await target.hover(timeout=3000)
@@ -47,18 +58,18 @@ async def player_pointer(page: Page, target, *, hover: bool = False, reveal=None
     except PlaywrightError as exc:
         if page.is_closed():
             raise
-        point = await locate(target)
+        point = await _player_point(target)
         if point is None:
             # 控件等待期间网站会收起控制栏；先原生唤出，再重新核对目标，不能点隐藏控件。
-            center = await locate(page.locator('#vjs_container'))
+            center = await _player_point(page.locator('#vjs_container'))
             if center is not None:
                 await page.mouse.move(center['x'], center['y'])
                 if reveal is not None:
-                    menu = await locate(reveal)
+                    menu = await _player_point(reveal)
                     if menu is not None:
                         await page.mouse.move(menu['x'], menu['y'])
                 for _ in range(10):
-                    point = await locate(target)
+                    point = await _player_point(target)
                     if point is not None:
                         break
                     await asyncio.sleep(.1)
@@ -544,7 +555,7 @@ class ZhihuishuAdapter(PlatformAdapter):
             details = []
             player = page.locator("#vjs_container").first
             try:
-                await (player if await player.count() else video).hover(timeout=2000)
+                await player_pointer(page, player if await player.count() else video, hover=True)
             except PlaywrightError as exc:
                 if page.is_closed():
                     raise
@@ -565,16 +576,7 @@ class ZhihuishuAdapter(PlatformAdapter):
                         raise
                     details.append(f"点击 {selector}：{exc}")
                     # 后台页面可能等不到逐帧稳定检查；仅点击当前可见且实际命中的原生按钮。
-                    point = await button.evaluate_all("""nodes => {
-                        const el = nodes[0];
-                        if (!el || el.closest(':disabled, [aria-disabled="true"]')) return null;
-                        const box = el.getBoundingClientRect(), css = getComputedStyle(el);
-                        const x = box.left + box.width / 2, y = box.top + box.height / 2;
-                        if (!box.width || !box.height || css.visibility !== 'visible' || +css.opacity === 0
-                            || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
-                        const hit = document.elementFromPoint(x, y);
-                        return hit && (hit === el || el.contains(hit)) ? {x, y} : null;
-                    }""")
+                    point = await _player_point(button)
                     if (point and await self.active_lesson_key(page) == active_key
                             and not await self.detect_question(page) and not await self.detect_captcha(page)
                             and await video.evaluate("v => v.paused && !v.ended && !v.__coursemateManualHold")):

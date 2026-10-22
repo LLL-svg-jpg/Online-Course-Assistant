@@ -188,18 +188,29 @@ async def publish_questions(page, provider, record, target, course_title, topics
     if needed == 0:
         logger.info(f"AI 提问 [{course_title}]：已发布至目标 {target} 条，待网站审核/次日统计；无效不算有效。")
         return True
-    if record.get("question_batch_day") == today:
-        logger.warn(f"AI 提问 [{course_title}]：今日已处理一批，审核未通过的项目留待后续核对，不循环补发。")
+    if record.get("question_batch_day") == today and (
+            record.get("question_generation_exhausted_day") == today
+            or any(p.get("status") != "published" for p in posts)):
+        logger.warn(f"AI 提问 [{course_title}]：今日已处理一批，生成或审核未通过的项目留待后续核对，不循环补发。")
         return False
     posted = []
-    for number in range(needed):
+    first_topic = len(posts) % len(topics)
+    remaining_topics = topics[first_topic:] + topics[:first_topic]
+    number = 0
+    while len(posted) < needed and remaining_topics:
         if should_stop():
             return False
         previous = [p["text"] for p in posts if p.get("text")] + examples
-        topic = topics[len(posts) % len(topics)]
+        topic = remaining_topics.pop(0)
+        number += 1
         text = await generate_question(provider, course_title, topic, previous, should_stop)
         if not text:
-            return False
+            if should_stop():
+                return False
+            logger.warn(f"AI 提问 [{course_title} / {topic}]：第 {number} 项三次生成未通过，"
+                        "本项不计完成，继续下一项提问。")
+            continue
+        remaining_topics.append(topic)
         await qa_click(page, page.locator(".ask-btn"))
         dialog = page.locator(".dialog-question:visible")
         await dialog.wait_for(state="visible", timeout=5000)
@@ -228,8 +239,9 @@ async def publish_questions(page, provider, record, target, course_title, topics
             posted.append(post)
             save()
             await dialog.wait_for(state="hidden", timeout=5000)
-            logger.info(f"AI 提问 [{course_title} / {topic}]：第 {number + 1}/{needed} 条已获发布回执，审核有效性待确认。")
-            if number + 1 < needed:
+            logger.info(f"AI 提问 [{course_title} / {topic}]：第 {number} 项已获发布回执，"
+                        f"本批已发布 {len(posted)}/{needed} 条，审核有效性待确认。")
+            if len(posted) < needed:
                 # 网站发布控件本身有3秒重复提交保护。
                 for _ in range(30):
                     if should_stop():
@@ -253,4 +265,10 @@ async def publish_questions(page, provider, record, target, course_title, topics
         logger.warn(f"AI 提问 [{course_title}]：部分问题未在自己的列表确认或已被屏蔽，未记为有效，保留页面。")
         return False
     logger.info(f"AI 提问 [{course_title}]：本批 {len(posted)} 条在自己的列表确认，最终有效数以网站后续审核统计为准。")
+    if len(posted) < needed:
+        record["question_batch_day"] = today
+        record["question_generation_exhausted_day"] = today
+        save()
+        logger.warn(f"AI 提问 [{course_title}]：各小节均已尝试，仍差 {needed - len(posted)} 条，未计完成；继续独立的后续计划。")
+        return False
     return True
