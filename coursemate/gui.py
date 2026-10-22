@@ -760,7 +760,7 @@ class CourseMateGUI:
 
         head = ttk.Frame(tab)
         head.grid(row=0, column=0, columnspan=4, sticky="ew")
-        ttk.Label(head, text="课程首页／播放页／学习通考试地址").pack(side="left")
+        ttk.Label(head, text="课程首页／播放页／考试地址").pack(side="left")
         ttk.Label(head, text="（右侧小框可写备注，方便认出是哪门课）",
                   style="Hint.TLabel").pack(side="left", padx=(6, 0))
         self.url_list = UrlList(tab)
@@ -1123,6 +1123,41 @@ class CourseMateGUI:
         ttk.Label(box, text="超时继续下一地址",
                   style="Hint.TLabel").grid(row=10, column=2, sticky="w", padx=(8, 0))
 
+        # ---- 智慧树计划 ----
+        box = section("智慧树计划")
+        self.zhihuishu_daily_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="补足每日学习习惯时长", variable=self.zhihuishu_daily_var).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(box, text="按网站规则补实际播放，已完成视频可复习；得分次日核对。",
+                  style="Hint.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 12))
+        self.zhihuishu_questions_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="AI 生成并发布本课程的学习问题", variable=self.zhihuishu_questions_var).grid(
+            row=2, column=0, columnspan=3, sticky="w")
+        ttk.Label(box, text="每门课累计提问目标").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.zhihuishu_question_count_var = tk.StringVar(value="5")
+        ttk.Entry(box, textvariable=self.zhihuishu_question_count_var,
+                  width=6).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(box, text="条（1～50）", style="Hint.TLabel").grid(row=3, column=2, sticky="w")
+        ttk.Label(box, text="需AI Key；默认补到5条，切题去重，审核结果单独核对。",
+                  style="Hint.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 12))
+        self.zhihuishu_answers_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="AI 回答本课程其他同学的问题", variable=self.zhihuishu_answers_var).grid(
+            row=5, column=0, columnspan=3, sticky="w")
+        ttk.Label(box, text="每门课累计回答目标").grid(row=6, column=0, sticky="w", pady=(8, 0))
+        self.zhihuishu_answer_count_var = tk.StringVar(value="5")
+        ttk.Entry(box, textvariable=self.zhihuishu_answer_count_var,
+                  width=6).grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(box, text="条（1～50）", style="Hint.TLabel").grid(row=6, column=2, sticky="w")
+        ttk.Label(box, text="跳过自己的及已答问题；不照抄，审核结果单独核对。",
+                  style="Hint.TLabel").grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 12))
+        ttk.Label(box, text="每日达标后").grid(row=8, column=0, sticky="w")
+        self.zhihuishu_daily_action_var = tk.StringVar(value="2. 当天结束，下次手动开始")
+        ttk.Combobox(box, state="readonly", textvariable=self.zhihuishu_daily_action_var,
+                     width=28, values=["1. 等待次日09:00继续", "2. 当天结束，下次手动开始"]).grid(
+            row=8, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        ttk.Label(box, text="选1需软件和电脑运行；停止可取消，学习周期外不再执行。",
+                  style="Hint.TLabel").grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         # ---- 网络 ----
         box = section("网络")
         ttk.Label(box, text="代理").grid(row=0, column=0, sticky="w")
@@ -1157,11 +1192,15 @@ class CourseMateGUI:
         box = section("本地题库")
         ttk.Checkbutton(box, text="启用题库缓存", variable=self.cache_var).grid(
             row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(box, text="试错验证出的正确答案会存进来，下次同题直接命中，一次都不用试",
+        ttk.Label(box, text="网站确认的正确答案会保存，旧记录遇到原题后补全题干，下次同题可复用",
                   style="Hint.TLabel").grid(row=1, column=0, columnspan=3, sticky="w")
         cache_btns = ttk.Frame(box)
         cache_btns.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Button(cache_btns, text="刷新统计", command=self._refresh_cache_stat).pack(side="left")
+        ttk.Button(cache_btns, text="查看题库", command=self._open_cache_text).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(cache_btns, text="打开题库文件夹", command=self._open_cache_dir).pack(
+            side="left", padx=(8, 0))
         ttk.Button(cache_btns, text="清空题库", command=self._clear_cache).pack(
             side="left", padx=(8, 0))
         self.cache_stat_label = ttk.Label(box, text="", style="Hint.TLabel")
@@ -2140,15 +2179,42 @@ class CourseMateGUI:
         if not messagebox.askokcancel(
                 "清空题库",
                 "将删除本地题库里的全部题目和答案。\n\n"
-                "这些是试错验证过的正确答案，删了下次遇到同样的题要重新试一遍。\n"
+                "题库命中记录也会清空；知识点重答反馈另行保留，不会自动导回。\n"
                 "确定要清空吗？", parent=self.root):
             return
         try:
-            db.unlink()
+            from .answer.cache import AnswerCache
+
+            cache = AnswerCache(db, enabled=True)
+            try:
+                cache.clear()
+            finally:
+                cache.close()
             self._append_log("SYSTEM", "本地题库已清空。")
             self._refresh_cache_stat()
-        except OSError as exc:
+        except Exception as exc:
             messagebox.showerror("清空失败", str(exc), parent=self.root)
+
+    def _open_cache_text(self) -> None:
+        try:
+            from .answer.cache import AnswerCache
+
+            cache = AnswerCache(self._cache_db(), enabled=True)
+            try:
+                path = cache.refresh_text_view()
+            finally:
+                cache.close()
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        except Exception as exc:
+            messagebox.showerror("打开题库失败", str(exc), parent=self.root)
+
+    def _open_cache_dir(self) -> None:
+        folder = self._cache_db().parent
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        except Exception as exc:
+            messagebox.showinfo("题库位置", f"{folder}\n\n({exc})", parent=self.root)
 
     def _open_data_dir(self) -> None:
         try:
@@ -2236,6 +2302,12 @@ class CourseMateGUI:
         self.login_timeout_var.set(str(d["login_timeout_seconds"]))
         self._apply_speed_ceiling()
         self.limit_var.set(str(int(d["limit_max_minutes"])))
+        self.zhihuishu_daily_var.set(False)
+        self.zhihuishu_questions_var.set(False)
+        self.zhihuishu_question_count_var.set("5")
+        self.zhihuishu_answers_var.set(False)
+        self.zhihuishu_answer_count_var.set("5")
+        self.zhihuishu_daily_action_var.set("2. 当天结束，下次手动开始")
 
         self.answer_enabled_var.set(d["answer_enabled"])
         self.retry_var.set(d["retry_until_correct"])
@@ -2460,6 +2532,18 @@ class CourseMateGUI:
             limit = float(self.limit_var.get() or 0)
         except ValueError:
             limit = 0.0
+        try:
+            question_count = int(self.zhihuishu_question_count_var.get())
+        except ValueError:
+            raise ValueError("每门课提问目标必须是1～50之间的整数。") from None
+        if not 1 <= question_count <= 50:
+            raise ValueError("每门课提问目标必须是1～50之间的整数。")
+        try:
+            answer_count = int(self.zhihuishu_answer_count_var.get())
+        except ValueError:
+            raise ValueError("每门课回答目标必须是1～50之间的整数。") from None
+        if not 1 <= answer_count <= 50:
+            raise ValueError("每门课回答目标必须是1～50之间的整数。")
         return {
             "username": self._accounts["default"]["username"],
             "password": self._accounts["default"]["password"],
@@ -2477,6 +2561,12 @@ class CourseMateGUI:
             "allow_high_speed": self.high_speed_var.get(),
             "captcha_popup": self.captcha_popup_var.get(),
             "limit_max_minutes": limit,
+            "zhihuishu_daily_enabled": self.zhihuishu_daily_var.get(),
+            "zhihuishu_questions_enabled": self.zhihuishu_questions_var.get(),
+            "zhihuishu_question_count": question_count,
+            "zhihuishu_answers_enabled": self.zhihuishu_answers_var.get(),
+            "zhihuishu_answer_count": answer_count,
+            "zhihuishu_daily_action": "wait" if self.zhihuishu_daily_action_var.get().startswith("1.") else "end",
             "answer_enabled": self.answer_enabled_var.get(),
             "retry_until_correct": self.retry_var.get(),
             "auto_submit": self.auto_submit_var.get(),
@@ -2538,6 +2628,14 @@ class CourseMateGUI:
         self.captcha_popup_var.set(cfg.captcha_popup)
         self._apply_speed_ceiling()   # 上限要跟着开关走，否则滑块还停在 2.0
         self.limit_var.set(str(int(cfg.limit_max_minutes)))
+        # 三项计划每次启动均需手动启用，不自动恢复上次保存的勾选状态。
+        self.zhihuishu_daily_var.set(False)
+        self.zhihuishu_questions_var.set(False)
+        self.zhihuishu_question_count_var.set(str(cfg.zhihuishu_question_count))
+        self.zhihuishu_answers_var.set(False)
+        self.zhihuishu_answer_count_var.set(str(cfg.zhihuishu_answer_count))
+        self.zhihuishu_daily_action_var.set("1. 等待次日09:00继续" if cfg.zhihuishu_daily_action == "wait"
+                                            else "2. 当天结束，下次手动开始")
         self.answer_enabled_var.set(cfg.answer_enabled)
         self.retry_var.set(cfg.retry_until_correct)
         self.auto_submit_var.set(cfg.auto_submit)

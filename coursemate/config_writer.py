@@ -48,6 +48,18 @@ limit_max_minutes = {limit_max_minutes}
 
 # 课程列表，按顺序依次学习。note 是给你自己看的备注，程序不使用
 {course_list}
+[zhihuishu_plan]
+# 智慧树新版课程：按网站规则补足每日实际视频播放时间
+daily_enabled = {zhihuishu_daily_enabled}
+# 每门课累计提问目标；发布成功与审核有效分开记录
+questions_enabled = {zhihuishu_questions_enabled}
+question_count = {zhihuishu_question_count}
+# 回答本课程其他同学的问题；每门课累计目标
+answers_enabled = {zhihuishu_answers_enabled}
+answer_count = {zhihuishu_answer_count}
+# wait 等待至次日09:00继续；end 当天结束，下次手动开始
+daily_action = "{zhihuishu_daily_action}"
+
 [answer]
 # 是否启用自动答题。关闭则遇到弹题仅暂停并提醒
 enabled = {answer_enabled}
@@ -154,6 +166,12 @@ def dump_config(data: dict[str, Any]) -> str:
         mute=_bool(data.get("mute", True)),
         allow_high_speed=_bool(data.get("allow_high_speed", False)),
         limit_max_minutes=float(data.get("limit_max_minutes", 0)),
+        zhihuishu_daily_enabled=_bool(data.get("zhihuishu_daily_enabled", False)),
+        zhihuishu_questions_enabled=_bool(data.get("zhihuishu_questions_enabled", False)),
+        zhihuishu_question_count=int(data.get("zhihuishu_question_count", 5)),
+        zhihuishu_answers_enabled=_bool(data.get("zhihuishu_answers_enabled", False)),
+        zhihuishu_answer_count=int(data.get("zhihuishu_answer_count", 5)),
+        zhihuishu_daily_action=_esc(data.get("zhihuishu_daily_action", "end")),
         answer_enabled=_bool(data.get("answer_enabled", True)),
         retry_until_correct=_bool(data.get("retry_until_correct", True)),
         auto_submit=_bool(data.get("auto_submit", False)),

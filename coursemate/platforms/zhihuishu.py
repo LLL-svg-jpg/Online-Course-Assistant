@@ -519,7 +519,7 @@ class ZhihuishuAdapter(PlatformAdapter):
                 return False
             lessons = await self.list_lessons(page)
             if not any(item.key == active_key and item.kind == "video"
-                       and not item.finished for item in lessons):
+                       and (not item.finished or getattr(self, "_daily_replay", False)) for item in lessons):
                 return False
             video = page.locator("video").first
             if not await video.count():
@@ -664,29 +664,30 @@ class ZhihuishuAdapter(PlatformAdapter):
 
     async def tune_playback(self, page: Page, speed: float, mute: bool) -> None:
         """仅使用页面提供的倍速档；新版播放器另落实媒体元素静音。"""
-        if (self._knowledge_busy or self._playback_recovering
-                or (self.is_mooc and not self._on_mooc_course(page))):
-            return
-        video = page.locator("video").first
-        if not await video.count():
-            return
-        if self.is_mooc and mute:
-            await video.evaluate("v => { v.muted = true; v.volume = 0; }")
-        current = await video.evaluate("v => v.playbackRate")
-        if abs(current - speed) < 0.01:
-            return
-        option = page.locator(f'.speedList .speedTab[rate="{speed:g}"]').first
-        if not await option.count() and speed == 1:
-            option = page.locator('.speedList .speedTab[rate="1.0"]').first
-        if not await option.count():
-            if self._unsupported_speed != speed:
-                logger.warn(f"智慧树播放器没有 {speed:g}× 档位，保持网页当前倍速。")
-                self._unsupported_speed = speed
-            return
-        box = page.locator(".speedBox").first
-        if await box.count():
-            await player_pointer(page, box, hover=True)
-        await player_pointer(page, option, reveal=box)
+        async with self._playback_lock:
+            if (self._knowledge_busy or self._playback_recovering
+                    or (self.is_mooc and not self._on_mooc_course(page))):
+                return
+            video = page.locator("video").first
+            if not await video.count():
+                return
+            if self.is_mooc and mute:
+                await video.evaluate("v => { v.muted = true; v.volume = 0; }")
+            current = await video.evaluate("v => v.playbackRate")
+            if abs(current - speed) < 0.01:
+                return
+            option = page.locator(f'.speedList .speedTab[rate="{speed:g}"]').first
+            if not await option.count() and speed == 1:
+                option = page.locator('.speedList .speedTab[rate="1.0"]').first
+            if not await option.count():
+                if self._unsupported_speed != speed:
+                    logger.warn(f"智慧树播放器没有 {speed:g}× 档位，保持网页当前倍速。")
+                    self._unsupported_speed = speed
+                return
+            box = page.locator(".speedBox").first
+            if await box.count():
+                await player_pointer(page, box, hover=True)
+            await player_pointer(page, option, reveal=box)
 
     def _on_mooc_course(self, page: Page) -> bool:
         current, course = urlparse(page.url), urlparse(self.course_url)
@@ -696,7 +697,7 @@ class ZhihuishuAdapter(PlatformAdapter):
                 and bool(course_id) and parse_qs(current.query).get("recruitAndCourseId") == course_id)
 
     async def process_lesson_knowledge(self, page: Page, lesson: Lesson,
-                                       provider, should_stop) -> bool:
+                                       provider, should_stop, cache=None) -> bool:
         if not self.is_mooc or lesson.kind != "video" or lesson.key in self._knowledge_lessons:
             return True
         if provider is None:
@@ -727,7 +728,7 @@ class ZhihuishuAdapter(PlatformAdapter):
                 logger.info(f"知识点检查 [{lesson.title}]：均免考或已达 100%，继续后续小节。")
                 return True
             stage = "处理知识点练习及恢复课程"
-            return await process_lesson(page, self, lesson, provider, should_stop)
+            return await process_lesson(page, self, lesson, provider, should_stop, cache=cache)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

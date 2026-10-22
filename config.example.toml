@@ -38,6 +38,16 @@ mute = true
 # 单门课程最长学习分钟数，0 表示不限制。人机验证与答题耗时不计入
 limit_max_minutes = 0
 
+[zhihuishu_plan]
+daily_enabled = false
+questions_enabled = false
+question_count = 5
+# AI 回答本课程其他同学的问题，累计目标默认5条
+answers_enabled = false
+answer_count = 5
+# wait：保持运行，次日09:00继续；end：当天结束
+daily_action = "end"
+
 [answer]
 # 是否启用自动答题。关闭则遇到弹题仅暂停并提醒你
 enabled = true

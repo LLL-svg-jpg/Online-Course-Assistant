@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import urlparse
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
@@ -139,6 +140,9 @@ async def study_lesson(
     if should_stop():
         raise StopRequested
     await wait_for_video_question(page, adapter, should_stop)
+    plan = getattr(adapter, "_course_plan", None)
+    if plan is not None and plan.pause_reason():
+        return "daily"
     if not await adapter.enter_lesson(page, lesson):
         return "skipped"
     if should_stop():
@@ -165,6 +169,8 @@ async def study_lesson(
         if should_stop():
             raise StopRequested
         await wait_for_video_question(page, adapter, should_stop)
+        if plan is not None and plan.pause_reason():
+            return "daily"
         if config.limit_max_minutes and clock.reached(config.limit_max_minutes):
             return "limit"
         if waited > LESSON_TIMEOUT_SECONDS:
@@ -226,6 +232,13 @@ async def study_course(
         logger.info("常见原因：① 地址不是视频播放页 ② 登录未生效 ③ 平台改版。")
         return False
 
+    plan = getattr(adapter, "_course_plan", None)
+    if plan is not None and not await plan.prepare(page, adapter, title, lessons):
+        return plan.outside_period
+    if plan is not None and plan.pause_reason():
+        logger.info(f"每日学习 [{title}]：{plan.pause_reason()}，未将剩余课件记为完成。")
+        return True
+
     pending = [ls for ls in lessons if not ls.finished]
     logger.info(f"共 {len(lessons)} 节，其中 {len(pending)} 节待完成。")
     if not pending:
@@ -238,7 +251,8 @@ async def study_course(
         # None 表示手动切课打断，不能把它记成练习失败或课程结束。
         if getattr(adapter, "_manual_lesson_key", ""):
             return None
-        task = asyncio.create_task(knowledge_handler(page, lesson, provider, should_stop))
+        task = asyncio.create_task(knowledge_handler(page, lesson, provider, should_stop,
+                                                    cache=cache if config.answer_cache else None))
         try:
             while not task.done():
                 if getattr(adapter, "_manual_lesson_key", ""):
@@ -278,6 +292,9 @@ async def study_course(
         if should_stop():
             raise StopRequested
         await wait_for_video_question(page, adapter, should_stop)
+        if plan is not None and plan.pause_reason():
+            logger.info(f"每日学习 [{title}]：{plan.pause_reason()}，未将剩余课件记为完成。")
+            return True
         # 每一轮重读目录，既拿到最新完成状态，也避免平台重绘后的旧节点。
         lessons = await adapter.list_lessons(page)
         if should_stop():
@@ -328,6 +345,9 @@ async def study_course(
         print()  # 结束 progress 的原地刷新行
         if should_stop():
             raise StopRequested
+        if reason == "daily":
+            logger.info(f"每日学习 [{title}]：{plan.pause_reason()}，先暂停本课程。")
+            return True
         if reason == "switched":
             lessons = await adapter.list_lessons(page)
             active_key = await adapter.active_lesson_key(page)
@@ -445,7 +465,7 @@ async def watch_address(awaitable, verification_task: asyncio.Task | None, shoul
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def run(config: Config, should_stop=_noop_stop) -> bool:
+async def _run_once(config: Config, should_stop=_noop_stop, plan_store=None) -> bool:
     items = config.course_items
     urls = [item["url"] for item in items]
     unresolved = [u for u in urls if resolve(u) is None]
@@ -601,6 +621,14 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
                         question_worker(page, adapter, config, clock, provider, cache), name="question"
                     ),
                 ]
+                course_plan = None
+                if (plan_store is not None and adapter.name == "知道智慧树"
+                        and urlparse(url).hostname == "wisdom-mooc.zhihuishu.com"):
+                    from .zhihuishu_plan import CoursePlan
+
+                    course_plan = CoursePlan(plan_store, account, url, config)
+                    adapter._course_plan = course_plan
+                    tasks.append(asyncio.create_task(course_plan.track(page, adapter), name="daily-time"))
                 tasks.append(asyncio.create_task(task_monitor(tasks), name="monitor"))
                 verification_skipped = False
                 try:
@@ -608,6 +636,11 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
                         course_processed = await watch_address(study_course(
                             page, adapter, url, clock, config, provider, cache, should_stop
                         ), tasks[2], should_stop)
+                        if (course_plan is not None and course_plan.ready
+                                and adapter._on_mooc_course(page)):
+                            plan_processed = await watch_address(course_plan.finish(
+                                page, adapter, provider, clock, should_stop), tasks[2], should_stop)
+                            course_processed = course_processed and plan_processed
                     except VerificationTimeout:
                         logger.warn(f"第 {address_number} 个地址验证等待超时，继续下一地址。", shift=True)
                         course_processed = False
@@ -626,7 +659,9 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
                         retain_failure_page = retain_failure_page or not verification_skipped
                         if not verification_skipped and any(
                             tab is not page and (is_homework_url(tab.url) or is_work_list_url(tab.url)
-                                                 or is_knowledge_url(tab.url))
+                                                 or is_knowledge_url(tab.url)
+                                                 or (course_plan is not None and
+                                                     urlparse(tab.url).hostname == "qah5.zhihuishu.com"))
                             for tab in context.pages
                         ):
                             retained_contexts.add(context)
@@ -684,3 +719,23 @@ async def run(config: Config, should_stop=_noop_stop) -> bool:
             if provider:
                 await provider.aclose()
             cache.close()
+            if plan_store is not None and browser is not None:
+                await browser.close()
+
+
+async def run(config: Config, should_stop=_noop_stop) -> bool:
+    if not (getattr(config, "zhihuishu_daily_enabled", False)
+            or getattr(config, "zhihuishu_questions_enabled", False)
+            or getattr(config, "zhihuishu_answers_enabled", False)):
+        return await _run_once(config, should_stop)
+    from .zhihuishu_plan import PlanStore, now, wait_next_day
+
+    store = PlanStore()
+    while not should_stop():
+        store.pending = False
+        round_day = now()
+        result = await _run_once(config, should_stop, store)
+        if (should_stop() or not store.pending or config.zhihuishu_daily_action != "wait"
+                or not await wait_next_day(config, should_stop, round_day)):
+            return result
+    return False

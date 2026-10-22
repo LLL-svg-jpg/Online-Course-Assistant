@@ -286,6 +286,37 @@ class Config:
         except (TypeError, ValueError):
             return 0.0
 
+    @property
+    def zhihuishu_daily_enabled(self) -> bool:
+        return bool(self._get_live("zhihuishu_plan", "daily_enabled", False))
+
+    @property
+    def zhihuishu_questions_enabled(self) -> bool:
+        return bool(self._get_live("zhihuishu_plan", "questions_enabled", False))
+
+    @property
+    def zhihuishu_question_count(self) -> int:
+        try:
+            return max(1, min(50, int(self._get_live("zhihuishu_plan", "question_count", 5))))
+        except (TypeError, ValueError):
+            return 5
+
+    @property
+    def zhihuishu_answers_enabled(self) -> bool:
+        return bool(self._get_live("zhihuishu_plan", "answers_enabled", False))
+
+    @property
+    def zhihuishu_answer_count(self) -> int:
+        try:
+            return max(1, min(50, int(self._get_live("zhihuishu_plan", "answer_count", 5))))
+        except (TypeError, ValueError):
+            return 5
+
+    @property
+    def zhihuishu_daily_action(self) -> str:
+        action = str(self._get_live("zhihuishu_plan", "daily_action", "end"))
+        return action if action in ("wait", "end") else "end"
+
     # ---------- 答题 ----------
     @property
     def answer_enabled(self) -> bool:

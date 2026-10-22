@@ -106,7 +106,7 @@ async def read_question(row, index: int) -> Question:
                     selected_keys=selected)
 
 
-async def solve_practice(page, provider, should_stop, feedback=None, label="") -> bool:
+async def solve_practice(page, provider, should_stop, feedback=None, label="", cache=None) -> bool:
     prefix = f"知识点练习 [{label}]" if label else "知识点练习"
     if not is_knowledge_url(page.url) or provider is None or should_stop():
         return False
@@ -131,6 +131,8 @@ async def solve_practice(page, provider, should_stop, feedback=None, label="") -
         known = feedback.correct(question) if feedback is not None else []
         if known:
             result = AnswerResult(option_keys=known, source="网站已判对记录")
+        elif cache is not None and (cached := cache.get(question)) is not None:
+            result = cached
         else:
             question.feedback = feedback.hint(question) if feedback is not None else ""
             task = asyncio.create_task(provider.solve(question))
@@ -166,7 +168,7 @@ async def solve_practice(page, provider, should_stop, feedback=None, label="") -
                 await labels.nth(i).click(timeout=3000)
         if set((await read_question(row, index)).selected_keys) != keys:
             return False
-        source = "网站已判对记录" if known else "AI"
+        source = "网站已判对记录" if known else "题库" if result.source == "cache" else "AI"
         logger.info(f"{prefix}：{source}已填写第 {index + 1}/{total} 题。")
         if index + 1 < total:
             await page.locator(".exam .next-btn:not(.disabled)").click(timeout=3000)
@@ -200,7 +202,7 @@ async def solve_practice(page, provider, should_stop, feedback=None, label="") -
         return False
 
 
-async def read_review(page, feedback, should_stop) -> bool:
+async def read_review(page, feedback, should_stop, cache=None) -> bool:
     await page.locator(".line1-count-link").click(timeout=5000)
     await page.wait_for_url("**/examAnalysis?**", timeout=15000)
     if urlsplit(page.url).hostname != "wisdom-mooc.zhihuishu.com":
@@ -218,16 +220,21 @@ async def read_review(page, feedback, should_stop) -> bool:
             feedback.record(question, False)
         elif "回答正确" in text:
             feedback.record(question, True)
+            if cache is not None:
+                cache.put(question, AnswerResult(option_keys=question.selected_keys,
+                    option_texts=[option.text for option in question.options
+                                  if option.key in question.selected_keys],
+                    confidence=1.0, reasoning="网站逐题判定正确", source="verified"))
         else:
             return False
     feedback.save()
     return True
 
 
-async def retry_practice(page, provider, should_stop, feedback, label) -> bool:
+async def retry_practice(page, provider, should_stop, feedback, label, cache=None) -> bool:
     for attempt in range(1, 4):
         current = f"{label}／第 {attempt}/3 次"
-        if not await solve_practice(page, provider, should_stop, feedback, current):
+        if not await solve_practice(page, provider, should_stop, feedback, current, cache):
             return False
         rate = page.locator(".charts-label-rate")
         await rate.wait_for(state="visible", timeout=15000)
@@ -253,7 +260,7 @@ async def retry_practice(page, provider, should_stop, feedback, label) -> bool:
         if should_stop():
             return False
         if await page.locator(".line1-count-link").count():
-            if not await read_review(page, feedback, should_stop):
+            if not await read_review(page, feedback, should_stop, cache):
                 return False
         elif score < 100:
             logger.warn(f"知识点练习 [{current}]：无法取得逐题反馈，停止重做以免重复错答，保留页面。")
@@ -270,7 +277,7 @@ async def retry_practice(page, provider, should_stop, feedback, label) -> bool:
     return False
 
 
-async def process_lesson(page, adapter, lesson, provider, should_stop, feedback=None) -> bool:
+async def process_lesson(page, adapter, lesson, provider, should_stop, feedback=None, cache=None) -> bool:
     """独立页面执行知识点；失败页留在原位，主课程可继续后续任务。"""
     from .platforms.zhihuishu import ZhihuishuAdapter, player_pointer
 
@@ -320,7 +327,7 @@ async def process_lesson(page, adapter, lesson, provider, should_stop, feedback=
             knowledge = parse_qs(urlsplit(practice.url).query)["knowledgeId"][0]
             if knowledge not in adapter._knowledge_done:
                 stage = "作答知识点练习"
-                if not await retry_practice(practice, provider, should_stop, feedback, label):
+                if not await retry_practice(practice, provider, should_stop, feedback, label, cache):
                     return False
                 adapter._knowledge_done.add(knowledge)
             if number + 1 == len(pending):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from .answer.ai import match_option
 from .answer.base import AnswerResult, Option, Question
@@ -10,6 +11,28 @@ from .logger import Logger
 logger = Logger()
 ROW_SEL = ".ai-class-exercise-dialog .ques-list .item"
 SAVE_API = "https://studyservice-api.zhihuishu.com/gateway/t/v1/popupAnswer/batchSaveLessonPopupExamSaveAnswer"
+
+
+async def cache_visible_answers(page, questions, cache) -> None:
+    completed = page.locator(".ai-class-exercise-dialog .el-dialog__footer .is-finish")
+    if not await completed.count() or not await completed.first.is_visible():
+        return
+    for question in questions:
+        row = page.locator(ROW_SEL).nth(question.index)
+        # 只读已提交页面展示的反馈，排除题干、选项和隐藏内容，不读答案API。
+        text = await row.evaluate("""el => [...el.children].filter(e =>
+            e.getClientRects().length && !e.matches('.option,.type,.question-info')
+            && !e.querySelector('.question-info')).map(e => e.innerText).join('\\n')""")
+        match = re.search(r"(?:^|\n)\s*正确答案[：:]\s*([A-Z](?:[\s,，、]*[A-Z])*)\s*(?:\n|$)", text)
+        if not match or not question.is_choice:
+            continue
+        keys = re.findall(r"[A-Z]", match[1])
+        if (len(set(keys)) != len(keys) or not set(keys) <= {o.key for o in question.options}
+                or (question.qtype != "multiple" and len(keys) != 1)):
+            continue
+        cache.put(question, AnswerResult(option_keys=keys,
+            option_texts=[o.text for o in question.options if o.key in keys], confidence=1.0,
+            reasoning="网站已提交页面公布正确答案", source="verified"))
 
 
 async def extract_questions(page) -> list[Question]:
@@ -37,6 +60,8 @@ async def process_popup(page, adapter, config, provider, cache) -> None:
     questions = await extract_questions(page)
     if not questions:
         return
+    if config.answer_cache:
+        await cache_visible_answers(page, questions, cache)
     for question in questions:
         if question.selected_keys:
             continue
@@ -84,6 +109,9 @@ async def process_popup(page, adapter, config, provider, cache) -> None:
             return
         logger.info(f"新版随堂练习 {len(current)} 题已提交并取得保存回执；不将保存或关闭当成判对。")
         await asyncio.sleep(0.3)
+        current = await extract_questions(page)
+        if config.answer_cache and [q.fingerprint for q in current] == [q.fingerprint for q in questions]:
+            await cache_visible_answers(page, current, cache)
         await adapter.close_question(page)
     except asyncio.CancelledError:
         raise
