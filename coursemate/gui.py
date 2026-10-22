@@ -2628,11 +2628,10 @@ class CourseMateGUI:
         self.captcha_popup_var.set(cfg.captcha_popup)
         self._apply_speed_ceiling()   # 上限要跟着开关走，否则滑块还停在 2.0
         self.limit_var.set(str(int(cfg.limit_max_minutes)))
-        # 三项计划每次启动均需手动启用，不自动恢复上次保存的勾选状态。
-        self.zhihuishu_daily_var.set(False)
-        self.zhihuishu_questions_var.set(False)
+        self.zhihuishu_daily_var.set(cfg.zhihuishu_daily_enabled)
+        self.zhihuishu_questions_var.set(cfg.zhihuishu_questions_enabled)
         self.zhihuishu_question_count_var.set(str(cfg.zhihuishu_question_count))
-        self.zhihuishu_answers_var.set(False)
+        self.zhihuishu_answers_var.set(cfg.zhihuishu_answers_enabled)
         self.zhihuishu_answer_count_var.set(str(cfg.zhihuishu_answer_count))
         self.zhihuishu_daily_action_var.set("1. 等待次日09:00继续" if cfg.zhihuishu_daily_action == "wait"
                                             else "2. 当天结束，下次手动开始")
